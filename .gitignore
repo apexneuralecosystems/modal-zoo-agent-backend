@@ -1,0 +1,10 @@
+config.json
+*.pyc
+__pycache__/
+.venv/
+venv/
+logs/
+models_cache/
+scripts_cache/
+*.log
+.DS_Store

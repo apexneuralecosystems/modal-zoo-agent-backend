@@ -1,0 +1,12 @@
+{
+  "server_url": "http://localhost:3001",
+  "secret_token": "REPLACE_WITH_PLAINTEXT_TOKEN_FROM_PLATFORM_DASHBOARD",
+  "branch_id": "REPLACE_WITH_BRANCH_UUID",
+  "mac_serial": "REPLACE_WITH_HARDWARE_SERIAL",
+  "agent_version": "1.0.0",
+  "heartbeat_interval_s": 30,
+  "poll_interval_s": 10,
+  "log_dir": "./logs",
+  "models_cache_dir": "./models_cache",
+  "scripts_cache_dir": "./scripts_cache"
+}
