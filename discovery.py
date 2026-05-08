@@ -149,6 +149,17 @@ def start_discovery(api: ApiClient, stop_event: threading.Event, interval_s: int
             for d in devices:
                 if d["id"] in seen_devices:
                     continue
+                # type=RTSP devices are single-stream — backend already
+                # created the companion camera row from the user-supplied
+                # rtsp_url at device-create time. No probing, no channel
+                # discovery. Just mark the device online and move on.
+                if (d.get("type") or "").upper() == "RTSP":
+                    try:
+                        api.post_device_status({"device_id": d["id"], "status": "online"})
+                    except Exception as e:
+                        log.warning("device-status post failed: %s", e)
+                    seen_devices.add(d["id"])
+                    continue
                 # Fix #5: only mark a device "seen" once we successfully
                 # probe it. A device that's powered-off on first poll used
                 # to be marked seen forever; now it gets retried each

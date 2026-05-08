@@ -22,6 +22,7 @@ from log_shipper import start_log_shipper
 from poller import start_poller
 from register import register
 from telemetry import start_telemetry
+from ws_streamer import start_ws_streamer
 
 
 def _start_cache_pruner(cfg: dict, stop_event: threading.Event) -> threading.Thread:
@@ -87,6 +88,7 @@ def main() -> int:
     start_discovery(api, stop_event, interval_s=300)
     start_log_shipper(api, cfg["log_dir"], stop_event)
     start_telemetry(api, stop_event)
+    start_ws_streamer(cfg["server_url"], cfg["secret_token"], stop_event)
     _start_cache_pruner(cfg, stop_event)
     poller_thread, _ = start_poller(api, cfg, stop_event)
 
