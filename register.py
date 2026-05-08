@@ -3,29 +3,18 @@ from __future__ import annotations
 
 import logging
 import platform
-import socket
 
 from api_client import ApiClient
+from net_utils import local_ip
 
 log = logging.getLogger("agent.register")
-
-
-def _local_ip() -> str | None:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return None
 
 
 def register(api: ApiClient, cfg: dict) -> bool:
     payload = {
         "branch_id": cfg["branch_id"],
         "serial_number": cfg["mac_serial"],
-        "ip_local": _local_ip(),
+        "ip_local": local_ip(),
         "os_version": f"{platform.system()} {platform.release()}",
         "agent_version": cfg.get("agent_version", "1.0.0"),
     }

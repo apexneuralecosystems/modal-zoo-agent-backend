@@ -7,10 +7,17 @@ the cloud which will auto-create a camera row.
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import threading
 import time
-from typing import Iterable
 from urllib.parse import quote
+
+# Fix #4: bound RTSP probe time. Must be set before cv2 import.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "stimeout;5000000|rw_timeout;5000000",
+)
 
 import cv2
 
@@ -27,6 +34,17 @@ COMMON_PATHS = (
     "/h264/ch{ch}/main/av_stream",               # Reolink-style
     "/live/ch{ch}",                              # Generic
 )
+
+
+def _tcp_reachable(host: str, port: int, timeout: float = 2.0) -> bool:
+    """True if we can open a TCP connection to host:port. Used to distinguish
+    'NVR powered off / wrong IP' from 'NVR up but speaks an RTSP path we
+    don't know about yet'."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def _build_rtsp(host: str, port: int, user: str | None, pwd: str | None, path: str) -> str:
@@ -59,11 +77,24 @@ def _probe_channel(host: str, port: int, user: str | None, pwd: str | None, chan
 
 
 def discover_device(api: ApiClient, device: dict, max_channels: int = MAX_CHANNELS_PROBED) -> dict | None:
-    log.info("probing device %s @ %s:%s", device["name"], device["ip_address"], device["port"])
+    host, port = device["ip_address"], device["port"]
+    log.info("probing device %s @ %s:%s", device["name"], host, port)
+
+    # P2-#1: cheap TCP probe first. Lets us distinguish "device offline"
+    # (post offline status) from "device online but no known RTSP path
+    # matched" (don't claim it's offline — log so we know to add a path).
+    if not _tcp_reachable(host, port):
+        log.warning("  TCP %s:%s unreachable — marking device offline", host, port)
+        try:
+            api.post_device_status({"device_id": device["id"], "status": "offline"})
+        except Exception as e:
+            log.warning("device-status post failed: %s", e)
+        return None
+
     channels = []
     for ch in range(1, max_channels + 1):
         ok, res, _path = _probe_channel(
-            device["ip_address"], device["port"],
+            host, port,
             device.get("username"), device.get("password"),
             ch,
         )
@@ -71,11 +102,17 @@ def discover_device(api: ApiClient, device: dict, max_channels: int = MAX_CHANNE
             log.info("  ch %s online (%s)", ch, res)
             channels.append({"channel": ch, "resolution": res})
         else:
-            # If the first channel fails, the device is likely unreachable.
+            # On channel 1 failure: device is reachable (TCP succeeded above)
+            # but no RTSP path template matched. Don't post offline — that
+            # would be misleading. Just stop probing and surface a warning
+            # so an operator knows to add a path template for this vendor.
             if ch == 1:
-                log.warning("  ch 1 failed — assuming device unreachable, stopping probe")
+                log.warning(
+                    "  ch 1 failed but %s:%s is TCP-reachable — vendor RTSP path likely unknown. "
+                    "Add a template to COMMON_PATHS.", host, port,
+                )
                 try:
-                    api.post_device_status({"device_id": device["id"], "status": "offline"})
+                    api.post_device_status({"device_id": device["id"], "status": "online"})
                 except Exception as e:
                     log.warning("device-status post failed: %s", e)
                 return None
@@ -112,8 +149,13 @@ def start_discovery(api: ApiClient, stop_event: threading.Event, interval_s: int
             for d in devices:
                 if d["id"] in seen_devices:
                     continue
-                discover_device(api, d)
-                seen_devices.add(d["id"])
+                # Fix #5: only mark a device "seen" once we successfully
+                # probe it. A device that's powered-off on first poll used
+                # to be marked seen forever; now it gets retried each
+                # interval until it answers.
+                result = discover_device(api, d)
+                if result is not None:
+                    seen_devices.add(d["id"])
             stop_event.wait(interval_s)
 
     t = threading.Thread(target=loop, name="discovery", daemon=True)

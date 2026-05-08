@@ -9,11 +9,16 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
 from urllib.parse import urlparse
 
 import requests
 
 log = logging.getLogger("agent.cache")
+
+# Fix #7: cached files older than this with no recent access (mtime) are
+# pruned. A pruned file is just re-downloaded on next use — no harm done.
+CACHE_MAX_AGE_S = 30 * 24 * 3600   # 30 days
 
 
 def _key_from_url(url: str) -> str:
@@ -29,6 +34,11 @@ def fetch_to_cache(url: str, cache_dir: str, suffix: str) -> str:
     key = _key_from_url(url)
     local = os.path.join(cache_dir, f"{key}{suffix}")
     if os.path.exists(local) and os.path.getsize(local) > 0:
+        # Touch so prune_cache doesn't remove a still-in-use asset.
+        try:
+            os.utime(local, None)
+        except OSError:
+            pass
         return local
 
     log.info("downloading %s -> %s", suffix, local)
@@ -41,3 +51,25 @@ def fetch_to_cache(url: str, cache_dir: str, suffix: str) -> str:
                     f.write(chunk)
     os.replace(tmp, local)
     return local
+
+
+def prune_cache(cache_dir: str, max_age_s: int = CACHE_MAX_AGE_S) -> int:
+    """Delete files in `cache_dir` whose mtime is older than `max_age_s`.
+    Returns the number of files removed. Safe to call any time — anything
+    deleted will simply be re-downloaded on next fetch."""
+    if not os.path.isdir(cache_dir):
+        return 0
+    cutoff = time.time() - max_age_s
+    removed = 0
+    for name in os.listdir(cache_dir):
+        path = os.path.join(cache_dir, name)
+        try:
+            if not os.path.isfile(path):
+                continue
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+                log.info("pruned stale cache file: %s", name)
+        except OSError as e:
+            log.warning("prune skip %s: %s", name, e)
+    return removed

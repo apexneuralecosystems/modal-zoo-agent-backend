@@ -14,6 +14,15 @@ import signal
 import sys
 import time
 
+# Fix #4: set FFmpeg socket timeouts BEFORE importing cv2 so the env vars
+# take effect. stimeout = TCP connect timeout (microseconds);
+# rw_timeout = read/write timeout (microseconds). Without these, a wedged
+# RTSP connection blocks the worker indefinitely.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "stimeout;5000000|rw_timeout;5000000",
+)
+
 import cv2
 
 from asset_cache import fetch_to_cache

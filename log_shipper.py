@@ -26,10 +26,16 @@ def _ship_one(api: ApiClient, path: Path) -> bool:
         return False
     try:
         out = api.get_log_upload_url(path.name)
+        # Fix #9: stream the file object straight to S3 instead of loading
+        # the whole rolled log into memory (a 500MB log was a 500MB RSS spike).
+        size = path.stat().st_size
         with path.open("rb") as f:
             r = requests.put(
-                out["presigned_url"], data=f.read(),
-                headers={"Content-Type": "text/plain"},
+                out["presigned_url"], data=f,
+                headers={
+                    "Content-Type": "text/plain",
+                    "Content-Length": str(size),
+                },
                 timeout=60,
             )
             r.raise_for_status()

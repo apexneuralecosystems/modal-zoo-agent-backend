@@ -5,6 +5,8 @@ import logging
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 log = logging.getLogger("agent.api")
 
@@ -19,6 +21,21 @@ class ApiClient:
             "Authorization": f"Bearer {secret_token}",
             "Content-Type": "application/json",
         })
+        # Fix #6: retry transient network/server errors so a 1-2s blip doesn't
+        # drop a heartbeat or a poll. 5 tries with exponential backoff
+        # (~0s, 1s, 2s, 4s, 8s) on connect errors and 429/5xx responses.
+        retry = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            backoff_factor=1,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST", "PATCH", "PUT", "DELETE"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def _url(self, path: str) -> str:
         return f"{self.base}{path}"

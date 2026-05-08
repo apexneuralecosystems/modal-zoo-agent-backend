@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import sys
-from datetime import date
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -36,21 +35,33 @@ def load_config() -> dict:
     return cfg
 
 
+class _DepFilter(logging.Filter):
+    """Ensure every record has a `dep` attribute so the formatter never KeyErrors."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "dep") or not getattr(record, "dep", ""):
+            record.dep = "-"
+        return True
+
+
 def setup_logging(log_dir: str, name: str = "agent") -> logging.Logger:
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    # Fix #3: include `dep` (deployment_id) so multi-worker logs are distinguishable.
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s [dep=%(dep)s]: %(message)s")
+    dep_filter = _DepFilter()
 
     fh = TimedRotatingFileHandler(
         os.path.join(log_dir, f"{name}.log"),
         when="midnight", backupCount=14, encoding="utf-8",
     )
     fh.setFormatter(fmt)
+    fh.addFilter(dep_filter)
     logger.addHandler(fh)
 
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
+    sh.addFilter(dep_filter)
     logger.addHandler(sh)
     return logger
