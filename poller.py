@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import subprocess
 import sys
 import threading
@@ -53,6 +54,25 @@ class JobPoller:
         # frame_interval, new RTSP) and restart the worker.
         self.hashes: dict[str, str] = {}
 
+    def _tail_worker(self, deployment_id: str, proc: subprocess.Popen, err_path: str):
+        """Read worker stdout line-by-line and re-emit through the main logger."""
+        dep_log = logging.getLogger("agent.worker")
+        short = deployment_id[:8]
+        try:
+            for raw in proc.stdout:  # type: ignore[union-attr]
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if not line:
+                    continue
+                lower = line.lower()
+                if "event triggered" in lower or "event sent" in lower or ">>> event" in lower:
+                    dep_log.info("[dep=%s] *** %s", short, line)
+                elif "[warning]" in lower or "failed" in lower or "error" in lower:
+                    dep_log.warning("[dep=%s] %s", short, line)
+                else:
+                    dep_log.info("[dep=%s] %s", short, line)
+        except Exception:
+            pass
+
     def _spawn(self, deployment_id: str, pipeline: dict):
         log.info("spawn worker dep=%s", deployment_id)
         cmd = [
@@ -60,9 +80,6 @@ class JobPoller:
             "--deployment-id", deployment_id,
             "--pipeline", json.dumps(pipeline),
         ]
-        # Fix #1: capture worker stderr to a per-deployment file so crashes
-        # before logging is set up (import errors, argparse failures, etc.)
-        # are visible instead of being silently discarded.
         log_dir = self.cfg.get("log_dir") or str(Path(__file__).resolve().parent / "logs")
         try:
             os.makedirs(log_dir, exist_ok=True)
@@ -70,25 +87,32 @@ class JobPoller:
             pass
         err_path = os.path.join(log_dir, f"worker-{deployment_id}.err")
         try:
-            err_fh = open(err_path, "ab")
-        except Exception as e:
-            log.warning("cannot open %s: %s", err_path, e)
-            err_fh = subprocess.DEVNULL
-        try:
+            # On Windows, CREATE_NEW_PROCESS_GROUP isolates the worker from
+            # Ctrl+C / console signals sent to the parent. Without this,
+            # pressing Ctrl+C kills YOLO's BLAS threads mid-inference and the
+            # worker crashes before it can POST the event.
+            extra = {}
+            if platform.system() == "Windows":
+                extra["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             proc = subprocess.Popen(
                 cmd,
-                stdout=err_fh,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 cwd=str(Path(__file__).resolve().parent),
+                **extra,
             )
             self.running[deployment_id] = proc
+            # Tail worker output in a daemon thread — re-emits through the
+            # main logger so event-fired lines appear in the terminal.
+            t = threading.Thread(
+                target=self._tail_worker,
+                args=(deployment_id, proc, err_path),
+                daemon=True,
+                name=f"tail-{deployment_id[:8]}",
+            )
+            t.start()
         except Exception as e:
             log.error("spawn failed for %s: %s", deployment_id, e)
-            try:
-                if err_fh is not subprocess.DEVNULL:
-                    err_fh.close()
-            except Exception:
-                pass
 
     def _kill(self, deployment_id: str):
         proc = self.running.pop(deployment_id, None)

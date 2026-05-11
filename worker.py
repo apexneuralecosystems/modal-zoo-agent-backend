@@ -82,6 +82,7 @@ def main():
             "backend_url": cfg["server_url"],
             "agent_token": cfg["secret_token"],
             "branch_timezone": pipeline.get("branch_timezone", "UTC"),
+            "config": pipeline.get("config") or {},
         })
     except Exception as e:
         log.error("inference module load failed: %s", e)
@@ -98,6 +99,8 @@ def main():
     signal.signal(signal.SIGINT, _stop)
 
     frame_idx = 0
+    inferred = 0
+    last_stat = time.time()
     backoff = 1
     while not stopping:
         cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
@@ -106,7 +109,7 @@ def main():
             time.sleep(backoff)
             backoff = min(30, backoff * 2)
             continue
-        log.info("RTSP open")
+        log.info("RTSP open — frame_interval=%d", frame_interval)
         backoff = 1
         try:
             while not stopping:
@@ -119,8 +122,14 @@ def main():
                     continue
                 try:
                     inf.run(frame)
+                    inferred += 1
                 except Exception as e:
                     log.warning("inference run error: %s", e)
+                # heartbeat every 30s so we can SEE the worker is alive and processing
+                now = time.time()
+                if now - last_stat >= 30:
+                    log.info("stats: frames_read=%d inferences=%d", frame_idx, inferred)
+                    last_stat = now
         finally:
             cap.release()
 
