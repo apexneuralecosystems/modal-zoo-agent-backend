@@ -110,35 +110,53 @@ class _StreamWorker:
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
         period = 1.0 / TARGET_FPS
         log.info("stream cam=%s: started", self.camera_id)
+        exit_reason = "stop_event"
         try:
             next_tick = time.monotonic()
             while not self.stop_event.is_set():
-                ok, frame = cap.read()
-                if not ok:
+                try:
+                    ok, frame = cap.read()
+                except Exception as e:
+                    exit_reason = f"cap.read exception: {e}"
+                    return
+                if not ok or frame is None:
                     # Camera dropped — try a quick reopen rather than die.
-                    log.warning("stream cam=%s: read failed, reopening", self.camera_id)
+                    log.warning("stream cam=%s: read failed (ok=%s frame=%s), reopening",
+                                self.camera_id, ok, frame is not None)
                     cap.release()
-                    time.sleep(1)
-                    cap = cv2.VideoCapture(self.rtsp_url)
+                    if self.stop_event.wait(1.0):
+                        exit_reason = "stop during reopen wait"
+                        return
+                    cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                    if not cap.isOpened():
+                        log.warning("stream cam=%s: reopen failed", self.camera_id)
                     continue
-                ok, jpg = cv2.imencode(".jpg", frame, encode_params)
+                try:
+                    ok, jpg = cv2.imencode(".jpg", frame, encode_params)
+                except Exception as e:
+                    exit_reason = f"imencode exception: {e}"
+                    return
                 if not ok:
                     continue
                 try:
                     self.ws.send_bytes(prefix + jpg.tobytes())
                 except Exception as e:
-                    log.warning("stream cam=%s: ws send failed (%s) — stopping worker", self.camera_id, e)
+                    exit_reason = f"ws send failed: {e}"
                     return
                 # Pace to TARGET_FPS — sleep only the remainder so we don't drift.
                 next_tick += period
                 delay = next_tick - time.monotonic()
                 if delay > 0:
-                    self.stop_event.wait(delay)
+                    if self.stop_event.wait(delay):
+                        exit_reason = "stop during pace wait"
+                        return
                 else:
                     next_tick = time.monotonic()
+        except Exception as e:
+            exit_reason = f"unexpected exception: {e!r}"
         finally:
             cap.release()
-            log.info("stream cam=%s: stopped", self.camera_id)
+            log.info("stream cam=%s: stopped (reason=%s)", self.camera_id, exit_reason)
 
 
 class _WsAdapter:
