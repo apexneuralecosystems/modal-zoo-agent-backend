@@ -1,6 +1,11 @@
 requests==2.32.3
 opencv-python==4.10.0.84
-ultralytics==8.3.40
+# Aligned with apps/backend/requirements.txt -- both ends must be on the same
+# ultralytics line so a .pt produced/cached on the cloud can be loaded on the
+# Mac without "Can't get attribute 'Segment26'" or similar class-not-found errors.
+ultralytics>=8.4.51
 numpy==1.26.4
 psutil==6.1.0
 websocket-client==1.8.0
+boto3>=1.34.0
+imageio-ffmpeg>=0.5.0
