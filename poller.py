@@ -30,9 +30,21 @@ def _pipeline_hash(pipeline: dict) -> str:
             return ""
         return url.split("?", 1)[0]
 
+    # Multi-model pipelines have a list of {node_id, url, ...}; hash each entry's
+    # underlying key so swapping ANY of the .pt files triggers a worker restart.
+    # Single-model pipelines just have model_presigned_url -- hash that as before.
+    models = pipeline.get("models") or []
+    if models:
+        models_hash = [
+            {"node_id": m.get("node_id"), "key": _strip(m.get("url"))}
+            for m in models
+        ]
+    else:
+        models_hash = [{"node_id": "__primary__", "key": _strip(pipeline.get("model_presigned_url"))}]
+
     snapshot = {
         "rtsp_url": pipeline.get("rtsp_url"),
-        "model": _strip(pipeline.get("model_presigned_url")),
+        "models": models_hash,
         "inference": _strip(pipeline.get("inference_script_presigned_url")),
         "config": pipeline.get("config") or {},
         "event_types": pipeline.get("event_types") or [],
