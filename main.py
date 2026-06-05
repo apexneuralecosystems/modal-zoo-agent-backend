@@ -85,7 +85,10 @@ def main() -> int:
         return 0
 
     start_heartbeat(api, cfg, stop_event)
-    start_discovery(api, stop_event, interval_s=300)
+    # Idle = once every 5 min (no point re-probing already-known devices).
+    # Active = every 15s while a device is flagged discovery_pending by the
+    # backend, so the Add-NVR / Retry-discovery flow feels responsive.
+    start_discovery(api, stop_event, interval_idle_s=300, interval_active_s=15)
     start_log_shipper(api, cfg["log_dir"], stop_event)
     start_telemetry(api, stop_event)
     start_ws_streamer(cfg["server_url"], cfg["secret_token"], stop_event)

@@ -91,6 +91,12 @@ class ApiClient:
     def post_discover(self, payload: dict) -> dict:
         return self._request("POST", "/agent/discover", json=payload)
 
+    def post_discover_failed(self, payload: dict) -> dict:
+        """Tell the cloud that probing this NVR/DVR failed so the user-facing
+        Add NVR flow can show a real reason instead of timing out.
+        payload: {"device_id": "...", "reason": "auth"|"unreachable"|"timeout"|"unknown", "detail": "..."}"""
+        return self._request("POST", "/agent/discover-failed", json=payload)
+
     def get_log_upload_url(self, filename: str) -> dict:
         return self._request("GET", "/agent/log-upload-url", params={"filename": filename})
 
