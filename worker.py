@@ -115,6 +115,19 @@ def main():
             "agent_token": cfg["secret_token"],
             "branch_timezone": pipeline.get("branch_timezone", "UTC"),
             "config": pipeline.get("config") or {},
+            # User-defined list of event_type / alert_type strings the
+            # deployment is allowed to emit. Scripts MUST only call
+            # fire_event(...) / fire_alert(...) with one of these values; the
+            # backend additionally rejects anything not in this list.
+            # An empty list means the deployment fires nothing.
+            "event_types": list(pipeline.get("event_types") or []),
+            # 'event' → script calls fire_event() → /agent/event
+            # 'alert' → script calls fire_alert() → /agent/alert
+            # Default 'event' if the field is missing (older deployments).
+            "output_kind": (pipeline.get("output_kind") or "event"),
+            # Severity used by every alert this deployment fires. Only
+            # meaningful when output_kind == 'alert'. Defaults to 'warning'.
+            "alert_severity": (pipeline.get("alert_severity") or "warning"),
         })
     except Exception as e:
         log.error("inference module load failed: %s", e)
@@ -143,6 +156,11 @@ def main():
             continue
         log.info("RTSP open — frame_interval=%d", frame_interval)
         backoff = 1
+        # Pipelines can register a per-camera-frame hook via the agent wrapper
+        # (record_frame). It collects clip footage at the camera's real fps
+        # while inference still runs at frame_interval. Pre-resolved here so
+        # we don't getattr() in the hot path.
+        record_frame_fn = getattr(inf, "record_frame", None)
         try:
             while not stopping:
                 ok, frame = cap.read()
@@ -150,6 +168,13 @@ def main():
                     log.warning("frame read failed — reconnecting")
                     break
                 frame_idx += 1
+                # Per-frame hook for clip recorders (pipeline event_sink) —
+                # always called, regardless of frame_interval skipping.
+                if record_frame_fn is not None:
+                    try:
+                        record_frame_fn(frame)
+                    except Exception as e:
+                        log.warning("record_frame error: %s", e)
                 if frame_idx % frame_interval != 0:
                     continue
                 try:
