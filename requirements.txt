@@ -1,5 +1,10 @@
 requests==2.32.3
 opencv-python==4.10.0.84
+# PyAV: bundles a modern FFmpeg that decodes real-world Hikvision H.264 RTSP
+# streams which opencv-python's bundled FFmpeg fails on (endless
+# cabac_init_idc / non-existing PPS errors, zero frames). The live streamer and
+# the discovery/probe paths decode with PyAV; cv2 is kept only for JPEG encode.
+av==16.0.1
 # Aligned with apps/backend/requirements.txt -- both ends must be on the same
 # ultralytics line so a .pt produced/cached on the cloud can be loaded on the
 # Mac without "Can't get attribute 'Segment26'" or similar class-not-found errors.
