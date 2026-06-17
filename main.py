@@ -15,6 +15,7 @@ import threading
 
 from api_client import ApiClient
 from asset_cache import prune_cache
+from commands import start_commands
 from config_loader import load_config, setup_logging
 from discovery import start_discovery
 from heartbeat import start_heartbeat
@@ -85,13 +86,16 @@ def main() -> int:
         return 0
 
     start_heartbeat(api, cfg, stop_event)
-    # Idle = once every 5 min (no point re-probing already-known devices).
-    # Active = every 15s while a device is flagged discovery_pending by the
-    # backend, so the Add-NVR / Retry-discovery flow feels responsive.
-    start_discovery(api, stop_event, interval_idle_s=300, interval_active_s=15)
+    # Both intervals are 15s now. The list_devices GET is cheap; a 5-min idle
+    # poll meant that newly-added NVRs sat unprobed for up to 5 minutes, and
+    # the UI's 60s "waiting for Mac" timeout fires long before that — so the
+    # user sees a fake "Mac didn't respond" error even though the agent is
+    # alive and well. 15s feels instantaneous to humans and costs nothing.
+    start_discovery(api, stop_event, interval_idle_s=15, interval_active_s=15)
     start_log_shipper(api, cfg["log_dir"], stop_event)
     start_telemetry(api, stop_event)
     start_ws_streamer(cfg["server_url"], cfg["secret_token"], stop_event)
+    start_commands(api, cfg, stop_event)
     _start_cache_pruner(cfg, stop_event)
     poller_thread, _ = start_poller(api, cfg, stop_event)
 

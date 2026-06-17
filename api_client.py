@@ -76,6 +76,16 @@ class ApiClient:
     def get_jobs(self) -> list[dict]:
         return self._request("GET", "/agent/jobs") or []
 
+    def get_commands(self) -> list[dict]:
+        """Fetch queued commands for this agent (the cloud marks them claimed).
+        Returns [] when there's nothing queued."""
+        return self._request("GET", "/agent/commands") or []
+
+    def post_command_result(self, payload: dict) -> dict:
+        """Report a command outcome.
+        payload: {"command_id": "...", "ok": bool, "result": {...}?, "error": "..."?}"""
+        return self._request("POST", "/agent/command-result", json=payload)
+
     def get_presigned_url(self, deployment_id: str, filename: str) -> dict:
         return self._request(
             "GET", "/agent/presigned-url",
@@ -108,3 +118,9 @@ class ApiClient:
 
     def post_device_status(self, payload: dict) -> dict:
         return self._request("POST", "/agent/device-status", json=payload)
+
+    def post_camera_status(self, payload: dict) -> dict:
+        """Report per-camera live status (batched) so the UI can show
+        online/offline/degraded per camera instead of a black tile.
+        payload: {"cameras": [{"camera_id": "...", "status": "online"|"offline"|"degraded"}, ...]}"""
+        return self._request("POST", "/agent/camera-status", json=payload)
