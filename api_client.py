@@ -110,6 +110,17 @@ class ApiClient:
     def get_log_upload_url(self, filename: str) -> dict:
         return self._request("GET", "/agent/log-upload-url", params={"filename": filename})
 
+    def get_heatmap_upload_url(self, camera_id: str, date: str, ext: str) -> dict:
+        return self._request(
+            "GET", "/agent/heatmap-upload-url",
+            params={"camera_id": camera_id, "date": date, "ext": ext},
+        )
+
+    def put_bytes(self, url: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+        """PUT raw bytes to a presigned S3 URL (bypasses the JSON session headers)."""
+        r = requests.put(url, data=data, headers={"Content-Type": content_type}, timeout=30)
+        r.raise_for_status()
+
     def post_telemetry(self, payload: dict) -> dict:
         return self._request("POST", "/agent/telemetry", json=payload)
 

@@ -19,6 +19,22 @@ from api_client import ApiClient
 
 log = logging.getLogger("agent.poller")
 WORKER_PATH = str(Path(__file__).resolve().parent / "worker.py")
+HEATMAP_WORKER_PATH = str(Path(__file__).resolve().parent / "heatmap_worker.py")
+
+
+def _heatmap_hash(job: dict) -> str:
+    """Stable hash of a heatmap job so a config change restarts the worker.
+    Excludes the rotating presigned model URL query string."""
+    model = (job.get("model_presigned_url") or "").split("?", 1)[0]
+    snapshot = {
+        "camera_id": job.get("camera_id"),
+        "rtsp_url": job.get("rtsp_url"),
+        "interval_minutes": job.get("interval_minutes"),
+        "conf": job.get("conf"),
+        "model": model,
+    }
+    blob = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha1(blob).hexdigest()
 
 
 def _pipeline_hash(pipeline: dict) -> str:
@@ -126,6 +142,38 @@ class JobPoller:
         except Exception as e:
             log.error("spawn failed for %s: %s", deployment_id, e)
 
+    def _spawn_heatmap(self, key: str, job: dict):
+        """Spawn a heatmap worker subprocess (one per enabled camera)."""
+        log.info("spawn heatmap worker %s", key)
+        cmd = [sys.executable, HEATMAP_WORKER_PATH, "--job", json.dumps(job)]
+        log_dir = self.cfg.get("log_dir") or str(Path(__file__).resolve().parent / "logs")
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            pass
+        err_path = os.path.join(log_dir, f"worker-{key.replace(':', '_')}.err")
+        try:
+            extra = {}
+            if platform.system() == "Windows":
+                extra["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=str(Path(__file__).resolve().parent),
+                **extra,
+            )
+            self.running[key] = proc
+            t = threading.Thread(
+                target=self._tail_worker,
+                args=(key, proc, err_path),
+                daemon=True,
+                name=f"tail-{key}",
+            )
+            t.start()
+        except Exception as e:
+            log.error("spawn heatmap failed for %s: %s", key, e)
+
     def _kill(self, deployment_id: str):
         proc = self.running.pop(deployment_id, None)
         self.hashes.pop(deployment_id, None)
@@ -156,7 +204,14 @@ class JobPoller:
             log.warning("get_jobs failed: %s", e)
             return
 
-        wanted = {j["deployment_id"]: j["pipeline"] for j in jobs}
+        # Deployment jobs carry deployment_id + pipeline; heatmap jobs carry
+        # type=='heatmap' + camera_id. Handle them separately but share the
+        # running-process map (heatmap keys are prefixed 'heatmap:').
+        deploy_jobs = [j for j in jobs if j.get("type") != "heatmap" and "deployment_id" in j]
+        heatmap_jobs = [j for j in jobs if j.get("type") == "heatmap"]
+
+        wanted = {j["deployment_id"]: j["pipeline"] for j in deploy_jobs}
+        wanted_heatmaps = {f"heatmap:{j['camera_id']}": j for j in heatmap_jobs}
 
         for dep_id, pipeline in wanted.items():
             new_hash = _pipeline_hash(pipeline)
@@ -172,9 +227,21 @@ class JobPoller:
                 self._spawn(dep_id, pipeline)
                 self.hashes[dep_id] = new_hash
 
-        for dep_id in list(self.running.keys()):
-            if dep_id not in wanted:
-                self._kill(dep_id)
+        for key, job in wanted_heatmaps.items():
+            new_hash = _heatmap_hash(job)
+            if key not in self.running:
+                self._spawn_heatmap(key, job)
+                self.hashes[key] = new_hash
+            elif self.hashes.get(key) != new_hash:
+                log.info("heatmap config changed for %s — restarting worker", key)
+                self._kill(key)
+                self._spawn_heatmap(key, job)
+                self.hashes[key] = new_hash
+
+        all_wanted = set(wanted.keys()) | set(wanted_heatmaps.keys())
+        for key in list(self.running.keys()):
+            if key not in all_wanted:
+                self._kill(key)
 
         self._reap()
 
