@@ -22,8 +22,12 @@ os.environ.setdefault(
 import cv2
 
 from heatmap_core import DwellHeatmap, render, save_raw, load_raw
-from heatmap_detector import PersonDetector, mask_from_boxes
-from dwell_gate import DwellGate
+from heatmap_brain_loader import load_brain as _default_load_brain
+import heatmap_brain_default as _DEFAULT_BRAIN
+
+# If a loaded cloud brain throws on this many CONSECUTIVE frames, give up on it
+# and switch to the built-in default brain (self-heal a runtime-broken brain).
+_BRAIN_ERROR_LIMIT = 10
 
 log = logging.getLogger("heatmap_worker")
 
@@ -44,25 +48,30 @@ def _npy_path(cam: str, day: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"heatmap_{cam}_{day}.npy")
 
 
-def run_heatmap(job, stop_flag, *, open_stream, upload_jpg, upload_npy, download_model):
+def run_heatmap(job, stop_flag, *, open_stream, upload_jpg, upload_npy, download_model,
+                download_brain=None, load_brain=_default_load_brain):
     """Run the dwell-heatmap loop for one camera until stop_flag is set.
 
-    job: dict with camera_id, rtsp_url, interval_minutes, model_presigned_url, conf.
-    stop_flag: object with .is_set() (e.g. threading.Event).
-    open_stream(rtsp) -> cv2.VideoCapture-like (has .read()/.release()).
-    upload_jpg(camera_id, day, jpg_bytes) / upload_npy(camera_id, day, npy_bytes).
-    download_model(presigned_url) -> local .pt path.
+    The detection + dwell logic lives in a "brain" module (downloaded from the
+    cloud when the job carries brain_presigned_url, else the baked-in default).
+    This runner just opens the stream, times frames, accumulates the brain's
+    per-frame heat mask, renders, uploads, and resets daily.
+
+    job: camera_id, rtsp_url, interval_minutes, model_presigned_url, conf,
+         dwell_seconds, brain_presigned_url, brain_version.
+    open_stream(rtsp) -> cv2.VideoCapture-like. upload_jpg/upload_npy(cam, day, bytes).
+    download_model(url) -> local .pt path. download_brain(url) -> local .py path.
     """
     cam = job["camera_id"]
     interval = int(job.get("interval_minutes", 30))
     conf = float(job.get("conf", 0.3))
-    # Only people who stay put for this long count as "dwelling" — walk-throughs
-    # are ignored. Tracking must stay on so each person keeps a stable id.
+    # Only people who stay put this long count as "dwelling" — walk-throughs are
+    # ignored. The brain owns the detector + dwell gate; tracking stays on.
     dwell_seconds = float(job.get("dwell_seconds", 2.0))
+    move_frac = float(job.get("move_frac", 0.5))
 
     model_path = download_model(job["model_presigned_url"])
-    det = PersonDetector(model_path, conf=conf, use_tracking=True)
-    gate = DwellGate(min_seconds=dwell_seconds)
+    brain = load_brain(job, download_brain=(download_brain or (lambda u: u)))
 
     cap = open_stream(job["rtsp_url"])
     ok, frame = cap.read()
@@ -72,6 +81,10 @@ def run_heatmap(job, stop_flag, *, open_stream, upload_jpg, upload_npy, download
         return
 
     h, w = frame.shape[:2]
+    brain.setup({
+        "model_path": model_path, "conf": conf, "dwell_seconds": dwell_seconds,
+        "move_frac": move_frac, "width": w, "height": h, "camera_id": cam,
+    })
     day = local_day(time.time())
     hm = DwellHeatmap(h, w)
     resumed = load_raw(_npy_path(cam, day))
@@ -85,6 +98,7 @@ def run_heatmap(job, stop_flag, *, open_stream, upload_jpg, upload_npy, download
     # after a short warmup so the user sees heat quickly, then every interval.
     last_upload = now0
     warmup_done = False
+    brain_errors = 0
 
     log.info("heatmap[%s]: started (%dx%d, interval=%dm)", cam, w, h, interval)
     while not stop_flag.is_set():
@@ -101,25 +115,33 @@ def run_heatmap(job, stop_flag, *, open_stream, upload_jpg, upload_npy, download
         if today != day:               # new day -> fresh background + accumulator
             day = today
             hm = DwellHeatmap(h, w)
-            gate = DwellGate(min_seconds=dwell_seconds)
+            if hasattr(brain, "reset"):
+                brain.reset()
             background = frame.copy()
             last_upload = now
             warmup_done = False
             log.info("heatmap[%s]: new day %s, reset", cam, day)
 
         try:
-            tracks = det.detect_tracks(frame)
+            mask = brain.heat_mask(frame, now)     # 255 where heat should be added
+            brain_errors = 0
         except Exception as e:
-            log.warning("heatmap[%s]: detect error: %s", cam, e)
+            brain_errors += 1
+            log.warning("heatmap[%s]: brain error (%d): %s", cam, brain_errors, e)
+            # A cloud brain that loaded but keeps crashing: switch to the safe
+            # built-in default so the heatmap keeps working instead of going blank.
+            if brain_errors >= _BRAIN_ERROR_LIMIT and brain is not _DEFAULT_BRAIN:
+                log.warning("heatmap[%s]: brain failing — falling back to default brain", cam)
+                brain = _DEFAULT_BRAIN
+                try:
+                    brain.setup({
+                        "model_path": model_path, "conf": conf, "dwell_seconds": dwell_seconds,
+                        "move_frac": move_frac, "width": w, "height": h, "camera_id": cam,
+                    })
+                    brain_errors = 0
+                except Exception as e2:
+                    log.warning("heatmap[%s]: default brain setup failed: %s", cam, e2)
             continue
-        # Key each track by its YOLO id; if the tracker didn't assign one, fall
-        # back to a coarse position bucket so the dwell timer still works.
-        keyed = [
-            ((tid if tid is not None else ("p", x1 // 40, y1 // 40)), x1, y1, x2, y2)
-            for (tid, x1, y1, x2, y2) in tracks
-        ]
-        dwelling = gate.update(keyed, now)     # only people stationary >= dwell_seconds
-        mask = mask_from_boxes(dwelling, h, w)
         hm.add(mask, dt)
 
         # First image after WARMUP_SECONDS of accumulation, then every interval.
@@ -187,6 +209,9 @@ def _main():
     def download_model(url):
         return fetch_to_cache(url, cfg["models_cache_dir"], ".pt")
 
+    def download_brain(url):
+        return fetch_to_cache(url, cfg["scripts_cache_dir"], ".py")
+
     def upload_jpg(cam, day, data):
         r = api.get_heatmap_upload_url(cam, day, "jpg")
         api.put_bytes(r["presigned_url"], data, "image/jpeg")
@@ -201,6 +226,7 @@ def _main():
         upload_jpg=upload_jpg,
         upload_npy=upload_npy,
         download_model=download_model,
+        download_brain=download_brain,
     )
 
 

@@ -31,7 +31,11 @@ def _heatmap_hash(job: dict) -> str:
         "rtsp_url": job.get("rtsp_url"),
         "interval_minutes": job.get("interval_minutes"),
         "conf": job.get("conf"),
+        "dwell_seconds": job.get("dwell_seconds"),
         "model": model,
+        # Bump the brain version in the cloud -> hash changes -> worker respawns
+        # and re-downloads the new brain (versioned S3 path = cache-busted).
+        "brain_version": job.get("brain_version"),
     }
     blob = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha1(blob).hexdigest()
