@@ -23,6 +23,7 @@ from log_shipper import start_log_shipper
 from poller import start_poller
 from register import register
 from telemetry import start_telemetry
+from watchdog import start_watchdog
 from ws_streamer import start_ws_streamer
 
 
@@ -60,6 +61,9 @@ def main() -> int:
     api = ApiClient(cfg["server_url"], cfg["secret_token"])
 
     stop_event = threading.Event()
+    # Set by the heartbeat on its first successful beat; the watchdog waits on
+    # it to confirm a freshly-swapped version is alive (else it rolls back).
+    healthy_event = threading.Event()
 
     def _early_stop(signum, frame):
         log.info("signal %s during boot — aborting", signum)
@@ -85,7 +89,10 @@ def main() -> int:
         log.info("stopped before registration completed")
         return 0
 
-    start_heartbeat(api, cfg, stop_event)
+    start_heartbeat(api, cfg, stop_event, healthy_event)
+    # Rollback watchdog: if this boot is a freshly-swapped version that never
+    # heartbeats healthy within the window, revert current_version to last_good.
+    start_watchdog(healthy_event, stop_event, timeout_s=int(cfg.get("update_watchdog_s", 300)))
     # Both intervals are 15s now. The list_devices GET is cheap; a 5-min idle
     # poll meant that newly-added NVRs sat unprobed for up to 5 minutes, and
     # the UI's 60s "waiting for Mac" timeout fires long before that — so the

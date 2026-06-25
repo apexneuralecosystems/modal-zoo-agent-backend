@@ -14,11 +14,12 @@ from pathlib import Path
 
 from api_client import ApiClient
 from clip_recorder import handle_fetch_clip
+from updater import handle_upgrade
 
 log = logging.getLogger("agent.commands")
 
 
-def _process_one(api: ApiClient, cfg: dict, cmd: dict) -> None:
+def _process_one(api: ApiClient, cfg: dict, cmd: dict, stop_event: threading.Event) -> None:
     cmd_id = cmd.get("id")
     ctype = cmd.get("type")
     payload = cmd.get("payload") or {}
@@ -31,6 +32,14 @@ def _process_one(api: ApiClient, cfg: dict, cmd: dict) -> None:
             result = handle_fetch_clip(payload, work_dir)
             api.post_command_result({"command_id": cmd_id, "ok": True, "result": result})
             log.info("fetch_clip %s done: %s bytes", cmd_id, result.get("bytes"))
+        elif ctype == "upgrade":
+            # Applies the update then sets stop_event so the process exits and
+            # launchd re-execs on the new code. We report success first; the
+            # post-restart heartbeat (new version) is the real confirmation,
+            # and the startup watchdog rolls back if it never arrives.
+            result = handle_upgrade(payload, api, stop_event)
+            api.post_command_result({"command_id": cmd_id, "ok": True, "result": result})
+            log.info("upgrade %s applied -> %s (exiting for restart)", cmd_id, result.get("version"))
         else:
             # Unknown command type — report failure so the cloud doesn't wait forever.
             api.post_command_result({
@@ -61,7 +70,7 @@ def start_commands(api: ApiClient, cfg: dict, stop_event: threading.Event) -> th
             for cmd in cmds:
                 if stop_event.is_set():
                     break
-                _process_one(api, cfg, cmd)
+                _process_one(api, cfg, cmd, stop_event)
             stop_event.wait(interval)
         log.info("commands loop stopped")
 

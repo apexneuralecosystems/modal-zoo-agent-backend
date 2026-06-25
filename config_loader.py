@@ -8,7 +8,9 @@ import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+from agent_paths import AGENT_ROOT
+
+CONFIG_PATH = AGENT_ROOT / "config.json"
 
 
 def load_config() -> dict:
@@ -26,7 +28,7 @@ def load_config() -> dict:
     cfg.setdefault("heartbeat_interval_s", 30)
     cfg.setdefault("poll_interval_s", 10)
 
-    base = Path(__file__).resolve().parent
+    base = AGENT_ROOT
     cfg["log_dir"] = str((base / cfg.get("log_dir", "./logs")).resolve())
     cfg["models_cache_dir"] = str((base / cfg.get("models_cache_dir", "./models_cache")).resolve())
     cfg["scripts_cache_dir"] = str((base / cfg.get("scripts_cache_dir", "./scripts_cache")).resolve())

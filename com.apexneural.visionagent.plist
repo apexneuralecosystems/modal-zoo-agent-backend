@@ -7,9 +7,11 @@
 
     <key>ProgramArguments</key>
     <array>
-        <!-- Replace with the actual path on the Mac Mini -->
-        <string>/Users/Shared/vision-agent/.venv/bin/python</string>
-        <string>/Users/Shared/vision-agent/main.py</string>
+        <!-- Self-update entrypoint: run.sh reads current_version and launches that
+             version's main.py. setup.sh generates this plist with the real path;
+             this static copy is for reference. Replace the path if editing by hand. -->
+        <string>/bin/sh</string>
+        <string>/Users/Shared/vision-agent/run.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
