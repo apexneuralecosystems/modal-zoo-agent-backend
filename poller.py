@@ -13,6 +13,7 @@ import platform
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from api_client import ApiClient
@@ -20,6 +21,14 @@ from api_client import ApiClient
 log = logging.getLogger("agent.poller")
 WORKER_PATH = str(Path(__file__).resolve().parent / "worker.py")
 HEATMAP_WORKER_PATH = str(Path(__file__).resolve().parent / "heatmap_worker.py")
+
+# worker.py sys.exit(2)s specifically when the model/inference-script download
+# fails. Without backoff, a bad model URL or a network blip makes the poller
+# respawn the worker every tick forever, pegging the Mac's CPU. This is
+# distinct from the exit(99) RTSP-dead-12h path below.
+DOWNLOAD_FAILURE_EXIT_CODE = 2
+MAX_DOWNLOAD_FAILURES = 5
+DOWNLOAD_RETRY_BACKOFF_S = 30
 
 
 def _heatmap_hash(job: dict) -> str:
@@ -75,7 +84,7 @@ def _pipeline_hash(pipeline: dict) -> str:
 
 
 class JobPoller:
-    def __init__(self, api: ApiClient, cfg: dict, stop_event: threading.Event):
+    def __init__(self, api: ApiClient, cfg: dict, stop_event: threading.Event, now_fn=time.monotonic):
         self.api = api
         self.cfg = cfg
         self.stop_event = stop_event
@@ -85,6 +94,14 @@ class JobPoller:
         # detect when the cloud pushed a config change (new model, new
         # frame_interval, new RTSP) and restart the worker.
         self.hashes: dict[str, str] = {}
+        # Deployments whose worker exited with code 99 (RTSP unreachable 12h).
+        # The backend marks them camera_offline and removes them from /agent/jobs.
+        # We keep the set here so we don't re-spawn before the backend responds.
+        self.permanently_failed: set[str] = set()
+        # dep_id -> {"count": int, "retry_at": float} while backing off, or
+        # {"count": 5, "given_up": True} once we've stopped retrying.
+        self.download_failures: dict[str, dict] = {}
+        self._now = now_fn
 
     def _tail_worker(self, deployment_id: str, proc: subprocess.Popen, err_path: str):
         """Read worker stdout line-by-line and re-emit through the main logger."""
@@ -181,6 +198,7 @@ class JobPoller:
     def _kill(self, deployment_id: str):
         proc = self.running.pop(deployment_id, None)
         self.hashes.pop(deployment_id, None)
+        self.download_failures.pop(deployment_id, None)
         if not proc:
             return
         log.info("kill worker dep=%s", deployment_id)
@@ -194,12 +212,70 @@ class JobPoller:
             log.warning("kill error %s: %s", deployment_id, e)
 
     def _reap(self):
-        """Drop entries whose subprocess has died so they get respawned."""
+        """Drop entries whose subprocess has died so they get respawned.
+        Exit code 99 means RTSP has been unreachable for 12h — mark the
+        deployment camera_offline in the backend and stop respawning.
+        Exit code 2 means the model/inference-script download failed — back
+        off and retry a bounded number of times (see _on_download_failure)."""
         dead = [d for d, p in self.running.items() if p.poll() is not None]
         for d in dead:
-            log.warning("worker dep=%s exited code=%s", d, self.running[d].returncode)
+            code = self.running[d].returncode
+            log.warning("worker dep=%s exited code=%s", d, code)
             self.running.pop(d, None)
-            self.hashes.pop(d, None)
+            if code == 99:
+                self.hashes.pop(d, None)
+                log.error("dep=%s RTSP unreachable 12h — marking camera_offline", d)
+                self.permanently_failed.add(d)
+                try:
+                    self.api.mark_camera_offline(d)
+                except Exception as e:
+                    log.error("mark_camera_offline failed for %s: %s", d, e)
+            elif code == DOWNLOAD_FAILURE_EXIT_CODE and not d.startswith("heatmap:"):
+                # Deliberately keep self.hashes[d] intact here (unlike the
+                # 99/else branches) — _tick() compares it against the freshly
+                # fetched pipeline hash to tell whether anything actually
+                # changed before it retries or gives up.
+                self._on_download_failure(d)
+            else:
+                self.hashes.pop(d, None)
+                self.download_failures.pop(d, None)
+
+    def _on_download_failure(self, dep_id: str):
+        count = self.download_failures.get(dep_id, {}).get("count", 0) + 1
+        if count >= MAX_DOWNLOAD_FAILURES:
+            log.error(
+                "dep=%s asset download failed %d times — giving up until the pipeline changes",
+                dep_id, count,
+            )
+            self.download_failures[dep_id] = {"count": count, "given_up": True}
+            try:
+                self.api.mark_deployment_failed(dep_id, reason="model_download_failed")
+            except Exception as e:
+                log.warning("failed to report download failure for dep=%s: %s", dep_id, e)
+        else:
+            log.warning(
+                "dep=%s asset download failed (%d/%d) — retrying in %ss",
+                dep_id, count, MAX_DOWNLOAD_FAILURES, DOWNLOAD_RETRY_BACKOFF_S,
+            )
+            self.download_failures[dep_id] = {
+                "count": count,
+                "retry_at": self._now() + DOWNLOAD_RETRY_BACKOFF_S,
+            }
+
+    def _should_hold_off(self, dep_id: str, new_hash: str) -> bool:
+        """True if dep_id just failed to download and isn't due for a retry yet."""
+        state = self.download_failures.get(dep_id)
+        if not state:
+            return False
+        if self.hashes.get(dep_id) != new_hash:
+            # Pipeline changed since the failure (new model URL, fixed config,
+            # a redeploy) — clear the history and give it a clean attempt.
+            self.download_failures.pop(dep_id, None)
+            return False
+        if state.get("given_up"):
+            return True
+        retry_at = state.get("retry_at")
+        return retry_at is not None and self._now() < retry_at
 
     def _tick(self):
         try:
@@ -218,8 +294,14 @@ class JobPoller:
         wanted_heatmaps = {f"heatmap:{j['camera_id']}": j for j in heatmap_jobs}
 
         for dep_id, pipeline in wanted.items():
+            # Skip deployments that exited with code 99 until the backend
+            # removes them from /agent/jobs (status → camera_offline).
+            if dep_id in self.permanently_failed:
+                continue
             new_hash = _pipeline_hash(pipeline)
             if dep_id not in self.running:
+                if self._should_hold_off(dep_id, new_hash):
+                    continue
                 self._spawn(dep_id, pipeline)
                 self.hashes[dep_id] = new_hash
             elif self.hashes.get(dep_id) != new_hash:
@@ -246,6 +328,10 @@ class JobPoller:
         for key in list(self.running.keys()):
             if key not in all_wanted:
                 self._kill(key)
+
+        # Once the backend confirms camera_offline (deployment drops out of jobs),
+        # clear the local guard so a future Restart shows up cleanly.
+        self.permanently_failed -= (self.permanently_failed - set(wanted.keys()))
 
         self._reap()
 

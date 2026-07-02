@@ -143,6 +143,9 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
+    STREAM_FAIL_LIMIT_S = 12 * 60 * 60  # 12 hours of continuous RTSP failure
+    stream_failed_since: float | None = None
+
     frame_idx = 0
     inferred = 0
     last_stat = time.time()
@@ -150,10 +153,25 @@ def main():
     while not stopping:
         cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         if not cap.isOpened():
-            log.warning("cannot open RTSP — retrying in %ss", backoff)
+            now = time.time()
+            if stream_failed_since is None:
+                stream_failed_since = now
+            elif now - stream_failed_since >= STREAM_FAIL_LIMIT_S:
+                log.error(
+                    "RTSP unreachable for 12h dep=%s — requesting camera-offline mark (exit 99)",
+                    deployment_id,
+                )
+                sys.exit(99)
+            elapsed_h = (now - stream_failed_since) / 3600
+            log.warning(
+                "cannot open RTSP — retrying in %ss (failing %.1fh / 12h)",
+                backoff, elapsed_h,
+            )
             time.sleep(backoff)
             backoff = min(30, backoff * 2)
             continue
+        # RTSP opened successfully — reset the failure clock.
+        stream_failed_since = None
         log.info("RTSP open — frame_interval=%d", frame_interval)
         backoff = 1
         # Pipelines can register a per-camera-frame hook via the agent wrapper

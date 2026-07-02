@@ -135,3 +135,18 @@ class ApiClient:
         online/offline/degraded per camera instead of a black tile.
         payload: {"cameras": [{"camera_id": "...", "status": "online"|"offline"|"degraded"}, ...]}"""
         return self._request("POST", "/agent/camera-status", json=payload)
+
+    def mark_camera_offline(self, deployment_id: str) -> dict:
+        """Tell the backend that RTSP has been unreachable for 12h on this
+        deployment. Sets status=camera_offline; the deployment is removed from
+        /agent/jobs until a user clicks Restart in the portal."""
+        return self._request("POST", f"/agent/deployments/{deployment_id}/camera-offline")
+
+    def mark_deployment_failed(self, deployment_id: str, reason: str) -> dict:
+        """Tell the backend the poller gave up retrying this deployment's
+        asset download (see MAX_DOWNLOAD_FAILURES in poller.py). Sets
+        status=error so it shows up in the dashboard instead of silently
+        never running."""
+        return self._request(
+            "POST", f"/agent/deployments/{deployment_id}/mark-failed", json={"reason": reason},
+        )
