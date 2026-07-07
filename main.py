@@ -1,9 +1,12 @@
 """Entrypoint — boot order:
   1. load config + setup logging
-  2. register with cloud
-  3. start heartbeat thread
-  4. start discovery thread
-  5. run poller in foreground (blocks)
+  2. start registration retry loop in the background (non-blocking)
+  3. start heartbeat/watchdog/discovery/telemetry/etc threads immediately
+  4. run poller in foreground (blocks)
+Registration does not gate step 3+: heartbeat/poller/etc only need the
+pre-provisioned secret_token (already valid before the agent even boots),
+not a successful /agent/register call — so a cloud outage at boot no longer
+leaves the whole agent idle. See register.py / _register_loop below.
 On SIGTERM / SIGINT, stop_event is set; threads + workers shut down cleanly.
 """
 from __future__ import annotations
@@ -51,6 +54,21 @@ def _start_cache_pruner(cfg: dict, stop_event: threading.Event) -> threading.Thr
     return t
 
 
+def _register_loop(api: ApiClient, cfg: dict, stop_event: threading.Event, log: logging.Logger) -> None:
+    """Keeps retrying /agent/register forever (capped backoff) in the
+    background. Runs alongside every other subsystem instead of blocking
+    them — see the Fix #16 note in main()."""
+    backoff = 5
+    while not stop_event.is_set():
+        if register(api, cfg):
+            log.info("registration succeeded")
+            return
+        log.warning("registration failed — retrying in %ss", backoff)
+        if stop_event.wait(backoff):
+            return
+        backoff = min(300, backoff * 2)
+
+
 def main() -> int:
     cfg = load_config()
     log = setup_logging(cfg["log_dir"], name="agent")
@@ -72,22 +90,17 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _early_stop)
     signal.signal(signal.SIGINT, _early_stop)
 
-    # Fix #6: keep retrying registration forever (with backoff) instead of
-    # aborting boot. If the cloud is briefly down when the Mac powers on,
-    # the agent must come up on its own once the cloud is back — not stay
-    # dead until someone manually restarts it.
-    backoff = 5
-    while not stop_event.is_set():
-        if register(api, cfg):
-            break
-        log.warning("registration failed — retrying in %ss", backoff)
-        if stop_event.wait(backoff):
-            break
-        backoff = min(300, backoff * 2)
-
-    if stop_event.is_set():
-        log.info("stopped before registration completed")
-        return 0
+    # Fix #16: registration used to block every other subsystem, so a cloud
+    # outage right at boot (e.g. a restart landing during cloud maintenance)
+    # left the whole Mac doing nothing at all — no heartbeat, no camera
+    # jobs, nothing — even though the process itself wasn't hung. Run it as
+    # a background retry loop instead; everything else starts immediately.
+    threading.Thread(
+        target=_register_loop,
+        args=(api, cfg, stop_event, log),
+        name="register",
+        daemon=True,
+    ).start()
 
     start_heartbeat(api, cfg, stop_event, healthy_event)
     # Rollback watchdog: if this boot is a freshly-swapped version that never

@@ -132,3 +132,23 @@ def test_handle_upgrade_sets_stop_event(tmp_path, monkeypatch):
 
     assert result == {"version": "1.1.0"}
     assert stop.is_set()
+
+
+def test_handle_upgrade_skips_if_already_running_target_version(tmp_path, monkeypatch):
+    """Fix #17: a duplicate/resent upgrade command for the version we're
+    already running must not re-download/reinstall/restart."""
+    import threading
+    updater, ap = _setup(tmp_path, monkeypatch, current="1.1.0")
+    calls = []
+    monkeypatch.setattr(
+        updater, "apply_upgrade",
+        lambda payload, download=None: calls.append(payload) or "should-not-be-used",
+    )
+    payload = {"version": "1.1.0", "zip_url": "u", "sha256": "irrelevant"}
+
+    stop = threading.Event()
+    result = updater.handle_upgrade(payload, api=None, stop_event=stop)
+
+    assert result == {"version": "1.1.0", "already_current": True}
+    assert calls == []  # apply_upgrade must never be invoked
+    assert not stop.is_set()  # nothing changed, no restart needed

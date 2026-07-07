@@ -90,6 +90,10 @@ class JobPoller:
         self.stop_event = stop_event
         self.interval = max(5, int(cfg.get("poll_interval_s", 10)))
         self.running: dict[str, subprocess.Popen] = {}
+        # Fix #18: track the stdout-tailing thread for each running worker so
+        # _kill() can force-close its pipe and join it instead of leaving it
+        # fire-and-forget. See _kill() and _sweep_tail_threads().
+        self.tail_threads: dict[str, threading.Thread] = {}
         # Fix #10: track the pipeline hash for each running worker so we can
         # detect when the cloud pushed a config change (new model, new
         # frame_interval, new RTSP) and restart the worker.
@@ -160,6 +164,7 @@ class JobPoller:
                 name=f"tail-{deployment_id[:8]}",
             )
             t.start()
+            self.tail_threads[deployment_id] = t
         except Exception as e:
             log.error("spawn failed for %s: %s", deployment_id, e)
 
@@ -192,6 +197,7 @@ class JobPoller:
                 name=f"tail-{key}",
             )
             t.start()
+            self.tail_threads[key] = t
         except Exception as e:
             log.error("spawn heatmap failed for %s: %s", key, e)
 
@@ -210,6 +216,43 @@ class JobPoller:
                 proc.kill()
         except Exception as e:
             log.warning("kill error %s: %s", deployment_id, e)
+
+        # Fix #18: the tail thread reading proc.stdout normally exits on its
+        # own once the pipe closes, but force-close it here too so a thread
+        # blocked on a slow-to-close pipe unblocks immediately instead of
+        # lingering. Then join with a short timeout — if it's still alive
+        # after that, leave it tracked so _sweep_tail_threads() keeps
+        # watching it instead of it silently disappearing from accounting.
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        t = self.tail_threads.get(deployment_id)
+        if t is not None:
+            t.join(timeout=2)
+            if t.is_alive():
+                log.warning("tail thread for %s did not exit after kill — still watching it", deployment_id)
+            else:
+                self.tail_threads.pop(deployment_id, None)
+
+    def _sweep_tail_threads(self):
+        """Fix #18: retry cleanup for any tail thread that outlived its job.
+        Runs every tick — turns what used to be a silent, unbounded leak into
+        a visible, self-healing one: nothing is left tracked as 'active'
+        without something actually still watching it."""
+        for key in list(self.tail_threads.keys()):
+            t = self.tail_threads[key]
+            if not t.is_alive():
+                self.tail_threads.pop(key, None)
+                continue
+            if key in self.running:
+                continue  # job is still active; thread is supposed to be alive
+            t.join(timeout=1)
+            if not t.is_alive():
+                self.tail_threads.pop(key, None)
+            else:
+                log.warning("orphaned tail thread for %s still hasn't exited", key)
 
     def _reap(self):
         """Drop entries whose subprocess has died so they get respawned.
@@ -334,6 +377,7 @@ class JobPoller:
         self.permanently_failed -= (self.permanently_failed - set(wanted.keys()))
 
         self._reap()
+        self._sweep_tail_threads()
 
     def run(self):
         log.info("poller starting interval=%ss", self.interval)

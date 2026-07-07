@@ -22,7 +22,7 @@ from pathlib import Path
 
 import requests
 
-from agent_paths import AGENT_ROOT, CURRENT_VERSION_FILE, STABLE_FILE, VERSIONS_DIR
+from agent_paths import AGENT_ROOT, CURRENT_VERSION_FILE, STABLE_FILE, VERSIONS_DIR, running_version
 
 log = logging.getLogger("agent.updater")
 
@@ -155,7 +155,17 @@ def apply_upgrade(payload: dict, download=None) -> str:
 
 def handle_upgrade(payload: dict, api, stop_event: threading.Event) -> dict:
     """Apply the upgrade then set stop_event so the process exits and launchd
-    re-execs on the new code. The startup watchdog confirms health or rolls back."""
+    re-execs on the new code. The startup watchdog confirms health or rolls back.
+
+    Fix #17: if we're already running the requested version (a duplicate or
+    resent upgrade command), skip the download/verify/unpack/pip-install/
+    restart pipeline entirely instead of redoing it — and restarting — for
+    no reason."""
+    target_version = str(payload["version"])
+    if target_version == running_version():
+        log.info("upgrade to %s requested but already running it — skipping", target_version)
+        return {"version": target_version, "already_current": True}
+
     version = apply_upgrade(payload)
     stop_event.set()
     return {"version": version}
