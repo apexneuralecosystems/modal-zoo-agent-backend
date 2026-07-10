@@ -56,7 +56,17 @@ from api_client import ApiClient
 
 log = logging.getLogger("agent.discovery")
 
-MAX_CHANNELS_PROBED = 16
+MAX_CHANNELS_PROBED = 128
+# Scanned in batches of CHANNEL_BATCH_SIZE (see discover_device): probe a
+# whole batch, and only continue into the next batch if that batch found at
+# least one camera. If a batch comes back completely empty, stop there
+# instead of continuing to the 128 ceiling. This is a deliberate tradeoff: a
+# camera wired at, say, channel 20 on a device with nothing at all in
+# channels 1-16 will be missed. Real NVR channel maps are contiguous from
+# near channel 1, so this is the right tradeoff for typical hardware —
+# scanning all 128 channels on every misconfigured/empty NVR would make
+# discovery ~8x slower than today's 16-channel ceiling for no benefit.
+CHANNEL_BATCH_SIZE = 16
 # Total per-path budget. Raised from 8s to 12s because we now spend the first
 # 1.5s draining corrupt mid-GOP frames (cap.grab only) before we start
 # measuring; the decoder needs that window to lock onto an I-frame cleanly.
@@ -337,36 +347,49 @@ def discover_device(api: ApiClient, device: dict, max_channels: int = MAX_CHANNE
     # we just move to the next channel. We only conclude the device failed if
     # NONE of the probed channels yielded a frame.
     channels = []
-    consecutive_misses = 0
     known_template: str | None = None  # vendor path learned from the first hit
-    for ch in range(1, max_channels + 1):
-        ok, res, tpl, thumbnail = _probe_channel(
-            host, port,
-            device.get("username"), device.get("password"),
-            ch,
-            only_template=known_template,
-            paths=ordered_paths,
-        )
-        if ok:
-            # tpl is the matching TEMPLATE; format it into the real path.
-            path = tpl.format(ch=ch) if tpl else None
-            log.info("  ch %s online (%s) path=%s", ch, res, path)
-            entry = {"channel": ch, "resolution": res, "path": path}
-            if thumbnail:
-                entry["thumbnail"] = thumbnail  # base64 JPEG data URL for the mapping UI
-            channels.append(entry)
-            consecutive_misses = 0
-            # Lock onto this vendor's path for the remaining channels so we make
-            # ~1 RTSP open per channel instead of trying all 5 templates each.
-            known_template = tpl
-        else:
-            consecutive_misses += 1
-            # Stop early only once we've already found at least one camera and
-            # then hit a run of empty channels (we've walked past the end of the
-            # populated range). If we've found nothing yet, keep probing the
-            # full range — the first camera might be on ch 2, 5, anywhere.
-            if channels and consecutive_misses >= 3:
-                break
+    for batch_start in range(1, max_channels + 1, CHANNEL_BATCH_SIZE):
+        batch_end = min(batch_start + CHANNEL_BATCH_SIZE - 1, max_channels)
+        found_in_batch = False
+        consecutive_misses = 0
+        for ch in range(batch_start, batch_end + 1):
+            ok, res, tpl, thumbnail = _probe_channel(
+                host, port,
+                device.get("username"), device.get("password"),
+                ch,
+                only_template=known_template,
+                paths=ordered_paths,
+            )
+            if ok:
+                # tpl is the matching TEMPLATE; format it into the real path.
+                path = tpl.format(ch=ch) if tpl else None
+                log.info("  ch %s online (%s) path=%s", ch, res, path)
+                entry = {"channel": ch, "resolution": res, "path": path}
+                if thumbnail:
+                    entry["thumbnail"] = thumbnail  # base64 JPEG data URL for the mapping UI
+                channels.append(entry)
+                found_in_batch = True
+                consecutive_misses = 0
+                # Lock onto this vendor's path for the remaining channels so we
+                # make ~1 RTSP open per channel instead of trying all 5 templates.
+                known_template = tpl
+            else:
+                consecutive_misses += 1
+                # Once this batch has already found a camera, we can stop
+                # probing the rest of it early after a run of misses — we've
+                # already walked past the populated range within this batch.
+                # This doesn't change the batch-level continue/stop decision
+                # below, it just avoids wasted probes within a batch that's
+                # already proven non-empty.
+                if found_in_batch and consecutive_misses >= 3:
+                    break
+
+        if not found_in_batch:
+            log.info(
+                "  channels %d-%d found nothing — stopping discovery here "
+                "(channels found so far: %d)", batch_start, batch_end, len(channels),
+            )
+            break
 
     if not channels:
         # Device is reachable (TCP ok) but no channel returned video on any

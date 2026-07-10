@@ -12,6 +12,54 @@ from agent_paths import AGENT_ROOT
 
 CONFIG_PATH = AGENT_ROOT / "config.json"
 
+# Fields that must be a positive, non-boolean number of seconds. Present as a
+# module-level tuple (not inline in _validate_config) so it's one place to
+# extend if a new interval-style field is added later.
+_POSITIVE_INT_FIELDS = ("heartbeat_interval_s", "poll_interval_s", "update_watchdog_s")
+
+# Fields that must be non-empty strings.
+_NON_EMPTY_STRING_FIELDS = (
+    "server_url", "secret_token", "branch_id", "mac_serial", "agent_version",
+    "log_dir", "models_cache_dir", "scripts_cache_dir",
+)
+
+
+def _validate_config(cfg: dict) -> list[str]:
+    """Catch bad field types/formats at startup instead of letting a
+    background thread (heartbeat/poller/watchdog) crash silently, hours
+    later, the first time it does int(cfg["some_field"]) on a bad value.
+    Returns a list of human-readable error strings — empty means valid.
+    Collects every error found rather than stopping at the first one, so a
+    single fix-and-rerun catches everything instead of playing whack-a-mole.
+    """
+    errors: list[str] = []
+
+    for key in _NON_EMPTY_STRING_FIELDS:
+        # Fields not yet defaulted (agent_version/log_dir/etc. before
+        # setdefault runs) are allowed to be absent here — load_config()
+        # applies defaults before calling this for the optional ones. Only
+        # flag a field that's present but the wrong type or empty.
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"{key} must be a non-empty string, got {value!r}")
+
+    server_url = cfg.get("server_url")
+    if isinstance(server_url, str) and not server_url.startswith(("http://", "https://")):
+        errors.append(f"server_url must start with http:// or https://, got {server_url!r}")
+
+    for key in _POSITIVE_INT_FIELDS:
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        # bool is a subclass of int in Python — exclude it explicitly so
+        # `"heartbeat_interval_s": true` doesn't silently pass as 1.
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            errors.append(f"{key} must be a positive number of seconds, got {value!r}")
+
+    return errors
+
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -27,6 +75,13 @@ def load_config() -> dict:
     cfg.setdefault("agent_version", "1.0.0")
     cfg.setdefault("heartbeat_interval_s", 30)
     cfg.setdefault("poll_interval_s", 10)
+
+    errors = _validate_config(cfg)
+    if errors:
+        sys.stderr.write("config.json has invalid field(s):\n")
+        for e in errors:
+            sys.stderr.write(f"  - {e}\n")
+        sys.exit(1)
 
     base = AGENT_ROOT
     cfg["log_dir"] = str((base / cfg.get("log_dir", "./logs")).resolve())
