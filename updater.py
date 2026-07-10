@@ -12,19 +12,82 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import os
 import shutil
 import subprocess
 import threading
+import time
 import zipfile
 from pathlib import Path
 
 import requests
 
-from agent_paths import AGENT_ROOT, CURRENT_VERSION_FILE, STABLE_FILE, VERSIONS_DIR, running_version
+from agent_paths import (
+    AGENT_ROOT, CURRENT_VERSION_FILE, FAILED_VERSIONS_FILE, STABLE_FILE,
+    VERSIONS_DIR, running_version,
+)
 
 log = logging.getLogger("agent.updater")
+
+# Escalating cooldown before re-attempting a version that already failed the
+# post-upgrade health check once (see watchdog.py). A version can fail health
+# because it's genuinely broken OR because the cloud/network happened to be
+# down for that whole window (e.g. planned server maintenance) — we can't
+# always tell which, so instead of retrying immediately (and risking the exact
+# same rollback thrash every poll tick), we back off further each time the
+# same version keeps failing.
+FAILURE_BACKOFF_S = [15 * 60, 60 * 60, 6 * 60 * 60]  # 15m, 1h, then 6h and holds
+
+
+def _read_failed_versions() -> dict:
+    try:
+        return json.loads(FAILED_VERSIONS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_failed_versions(data: dict) -> None:
+    tmp = FAILED_VERSIONS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    os.replace(tmp, FAILED_VERSIONS_FILE)
+
+
+def record_failed_version(version: str) -> None:
+    """Called by the watchdog right after it rolls back `version`."""
+    data = _read_failed_versions()
+    entry = data.get(version, {"count": 0})
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["last_failed_at"] = time.time()
+    data[version] = entry
+    try:
+        _write_failed_versions(data)
+    except OSError as e:
+        log.warning("could not persist failed-version record for %s: %s", version, e)
+
+
+def failure_backoff_remaining_s(version: str) -> float:
+    """Seconds until `version` may be re-attempted (0 if it never failed, or
+    its cooldown already elapsed)."""
+    entry = _read_failed_versions().get(version)
+    if not entry:
+        return 0.0
+    count = int(entry.get("count", 1))
+    backoff = FAILURE_BACKOFF_S[min(count, len(FAILURE_BACKOFF_S)) - 1]
+    elapsed = time.time() - float(entry.get("last_failed_at", 0))
+    return max(0.0, backoff - elapsed)
+
+
+def clear_failed_version(version: str) -> None:
+    """Called once a version is confirmed healthy — forget any past failures
+    so a since-fixed version isn't stuck on an old cooldown."""
+    data = _read_failed_versions()
+    if data.pop(version, None) is not None:
+        try:
+            _write_failed_versions(data)
+        except OSError as e:
+            log.warning("could not clear failed-version record for %s: %s", version, e)
 
 
 def _venv_python() -> str | None:
@@ -165,6 +228,14 @@ def handle_upgrade(payload: dict, api, stop_event: threading.Event) -> dict:
     if target_version == running_version():
         log.info("upgrade to %s requested but already running it — skipping", target_version)
         return {"version": target_version, "already_current": True}
+
+    remaining = failure_backoff_remaining_s(target_version)
+    if remaining > 0:
+        log.warning(
+            "upgrade to %s skipped — it failed its health check recently, "
+            "retrying again in %ds", target_version, int(remaining),
+        )
+        return {"version": target_version, "held_off": True, "retry_after_s": int(remaining)}
 
     version = apply_upgrade(payload)
     stop_event.set()

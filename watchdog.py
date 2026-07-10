@@ -10,7 +10,7 @@ import logging
 import threading
 
 from agent_paths import LAST_GOOD_FILE, STABLE_FILE, VERSIONS_DIR, running_version
-from updater import write_current_version
+from updater import clear_failed_version, record_failed_version, write_current_version
 
 log = logging.getLogger("agent.watchdog")
 
@@ -56,6 +56,7 @@ def start_watchdog(
     def loop():
         if healthy_event.wait(timeout=timeout_s):
             mark_healthy(current)
+            clear_failed_version(current)
             log.info("version %s confirmed healthy (last_good updated)", current)
             return
 
@@ -64,6 +65,12 @@ def start_watchdog(
                 "version %s never became healthy in %ss — rolling back to %s",
                 current, timeout_s, rollback_target,
             )
+            # Remember this failure so the next upgrade command for the same
+            # version backs off instead of immediately repeating the same
+            # rollback (see updater.failure_backoff_remaining_s) — e.g. if the
+            # server was just down for its own maintenance during this window,
+            # we don't want to thrash on every retry until it comes back.
+            record_failed_version(current)
             try:
                 write_current_version(rollback_target)
             except Exception as e:

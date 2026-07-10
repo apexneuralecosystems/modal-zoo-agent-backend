@@ -105,7 +105,10 @@ def main() -> int:
     start_heartbeat(api, cfg, stop_event, healthy_event)
     # Rollback watchdog: if this boot is a freshly-swapped version that never
     # heartbeats healthy within the window, revert current_version to last_good.
-    start_watchdog(healthy_event, stop_event, timeout_s=int(cfg.get("update_watchdog_s", 300)))
+    # 15 minutes, not 5 — a short server-maintenance window shouldn't look
+    # identical to a genuinely broken update. Repeated failures of the same
+    # version also back off (see updater.failure_backoff_remaining_s).
+    start_watchdog(healthy_event, stop_event, timeout_s=int(cfg.get("update_watchdog_s", 900)))
     # Both intervals are 15s now. The list_devices GET is cheap; a 5-min idle
     # poll meant that newly-added NVRs sat unprobed for up to 5 minutes, and
     # the UI's 60s "waiting for Mac" timeout fires long before that — so the

@@ -57,9 +57,14 @@ def setup_logging(log_dir: str, name: str = "agent") -> logging.Logger:
     if not getattr(root, "_vision_configured", False):
         root.setLevel(logging.INFO)
 
+        # backupCount=0 — never auto-delete a rolled log file here. Deletion is
+        # log_shipper's job, and only AFTER a file is confirmed uploaded to the
+        # cloud (see log_shipper.py). If we let the handler purge on a fixed
+        # day count, a rolled-but-not-yet-shipped file (e.g. cloud unreachable
+        # for a while) would be silently destroyed before it ever shipped.
         fh = TimedRotatingFileHandler(
             os.path.join(log_dir, f"{name}.log"),
-            when="midnight", backupCount=14, encoding="utf-8",
+            when="midnight", backupCount=0, encoding="utf-8",
         )
         fh.setFormatter(fmt)
         fh.addFilter(dep_filter)

@@ -49,6 +49,11 @@ LAST_GOOD_FILE = AGENT_ROOT / "last_good"
 # The "stable" channel version known to this Mac — the watchdog drops to this
 # (not just the previous version) when a "latest" update fails to go healthy.
 STABLE_FILE = AGENT_ROOT / "stable_version"
+# Remembers versions the watchdog has already rolled back, with a timestamp and
+# count, so a version that just failed isn't immediately re-attempted the very
+# next time the poller sees it offered (e.g. the server was just down for its
+# own maintenance, not because the version is actually broken) — see updater.py.
+FAILED_VERSIONS_FILE = AGENT_ROOT / "failed_versions.json"
 
 
 def running_version() -> str:

@@ -20,6 +20,18 @@ log = logging.getLogger("agent.log_shipper")
 SHIP_INTERVAL_S = 3600
 
 
+# Minimum time to allow for any upload, plus extra time scaled to file size so
+# a large rolled log (which can legitimately take longer than a fixed 60s on a
+# slow/rate-limited uplink) gets a real chance to finish instead of timing out
+# on every single hourly attempt forever.
+MIN_UPLOAD_TIMEOUT_S = 60
+UPLOAD_BYTES_PER_S = 200 * 1024  # assume a conservative 200KB/s minimum uplink
+
+
+def _upload_timeout(size: int) -> int:
+    return max(MIN_UPLOAD_TIMEOUT_S, int(size / UPLOAD_BYTES_PER_S))
+
+
 def _ship_one(api: ApiClient, path: Path) -> bool:
     marker = path.with_suffix(path.suffix + ".shipped")
     if marker.exists():
@@ -36,11 +48,19 @@ def _ship_one(api: ApiClient, path: Path) -> bool:
                     "Content-Type": "text/plain",
                     "Content-Length": str(size),
                 },
-                timeout=60,
+                timeout=_upload_timeout(size),
             )
             r.raise_for_status()
         marker.write_text(out.get("s3_key", ""))
         log.info("shipped %s -> %s", path.name, out.get("s3_key"))
+        # Now that it's safely in the cloud, reclaim local disk. The rolled
+        # file itself is never auto-deleted before this (backupCount=0 on the
+        # rotating handler) — this is the only place a log file goes away, and
+        # it only happens after a confirmed successful upload.
+        try:
+            path.unlink()
+        except OSError as e:
+            log.warning("shipped %s but couldn't delete local copy: %s", path.name, e)
         return True
     except Exception as e:
         log.warning("ship %s failed: %s", path.name, e)

@@ -39,6 +39,14 @@ def local_day(ts: float) -> str:
 
 WARMUP_SECONDS = 60  # upload a first heatmap this soon after start (then every interval)
 
+# The accumulator is only persisted to local disk as a side effect of _flush(),
+# which also renders + uploads to S3 and only runs every `interval_minutes`
+# (default 30). If the worker crashes between flushes, everything accumulated
+# since the last one is lost. This is a separate, much cheaper LOCAL-ONLY save
+# (no render, no S3 upload) so a crash loses at most ~1 minute of dwell data
+# instead of up to a full interval.
+LOCAL_SAVE_INTERVAL_S = 60
+
 
 def due_to_upload(last_upload_ts: float, now_ts: float, interval_minutes: int) -> bool:
     return (now_ts - last_upload_ts) >= interval_minutes * 60
@@ -97,6 +105,7 @@ def run_heatmap(job, stop_flag, *, open_stream, upload_jpg, upload_npy, download
     # Do NOT flush at startup (the accumulator is empty). Flush a first image
     # after a short warmup so the user sees heat quickly, then every interval.
     last_upload = now0
+    last_local_save = now0
     warmup_done = False
     brain_errors = 0
 
@@ -119,6 +128,7 @@ def run_heatmap(job, stop_flag, *, open_stream, upload_jpg, upload_npy, download
                 brain.reset()
             background = frame.copy()
             last_upload = now
+            last_local_save = now
             warmup_done = False
             log.info("heatmap[%s]: new day %s, reset", cam, day)
 
@@ -152,7 +162,13 @@ def run_heatmap(job, stop_flag, *, open_stream, upload_jpg, upload_npy, download
         if should_flush:
             _flush(cam, day, hm, background, upload_jpg, upload_npy)
             last_upload = now
+            last_local_save = now
             warmup_done = True
+        elif (now - last_local_save) >= LOCAL_SAVE_INTERVAL_S:
+            # Cheap local-only checkpoint between cloud flushes, so a crash
+            # right before the next interval doesn't wipe ~30 minutes of dwell.
+            save_raw(hm.accumulator, _npy_path(cam, day))
+            last_local_save = now
 
     # final flush on stop so the latest dwell isn't lost
     _flush(cam, day, hm, background, upload_jpg, upload_npy)
