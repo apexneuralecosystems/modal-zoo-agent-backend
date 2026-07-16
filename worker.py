@@ -153,6 +153,10 @@ def main():
     while not stopping:
         cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         if not cap.isOpened():
+            # A failed open still allocates real handles/sockets under the
+            # hood (FFmpeg backend) — release them now, not just on the
+            # success path below, or a long outage leaks one per retry.
+            cap.release()
             now = time.time()
             if stream_failed_since is None:
                 stream_failed_since = now

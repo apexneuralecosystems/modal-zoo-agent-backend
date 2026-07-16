@@ -12,9 +12,12 @@ On SIGTERM / SIGINT, stop_event is set; threads + workers shut down cleanly.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
+
+from pathlib import Path
 
 from api_client import ApiClient
 from asset_cache import prune_cache
@@ -26,6 +29,7 @@ from log_shipper import start_log_shipper
 from poller import start_poller
 from register import register
 from telemetry import start_telemetry
+from updater import prune_old_versions
 from watchdog import start_watchdog
 from ws_streamer import start_ws_streamer
 
@@ -33,20 +37,44 @@ from ws_streamer import start_ws_streamer
 def _start_cache_pruner(cfg: dict, stop_event: threading.Event) -> threading.Thread:
     """Background thread: prunes the model + script caches once a day.
     Files older than 30d that aren't being used get deleted; if needed
-    again they're just re-downloaded on next /agent/jobs poll."""
+    again they're just re-downloaded on next /agent/jobs poll.
+
+    Also sweeps the fetch_clip scratch folder (`<log_dir>/clips/`) as a safety
+    net: normally a clip is deleted right after its S3 upload attempt (success
+    or failure — see clip_recorder.py), but any clip left behind by a crash or
+    a killed process mid-upload would otherwise sit there forever.
+
+    Also prunes superseded agent code versions under versions/<v>/ — every
+    published update used to accumulate on disk forever. Only the running,
+    Stable, and last-known-good versions are protected (watchdog.py's
+    rollback needs them present without a re-download); everything else is
+    deleted and would simply be re-fetched if ever needed again."""
     log = logging.getLogger("agent.cache")
     interval = 24 * 3600
+    clips_dir = os.path.join(
+        cfg.get("log_dir") or str(Path(__file__).resolve().parent / "logs"),
+        "clips",
+    )
+    CLIPS_MAX_AGE_S = 24 * 3600  # leftover clips are scratch, not a cache — 1 day is plenty
 
     def loop():
         # Run once at startup, then daily.
         while not stop_event.is_set():
-            for d in (cfg["models_cache_dir"], cfg["scripts_cache_dir"]):
+            for d, max_age in ((cfg["models_cache_dir"], None),
+                                (cfg["scripts_cache_dir"], None),
+                                (clips_dir, CLIPS_MAX_AGE_S)):
                 try:
-                    n = prune_cache(d)
+                    n = prune_cache(d) if max_age is None else prune_cache(d, max_age)
                     if n:
                         log.info("pruned %s old files from %s", n, d)
                 except Exception as e:
                     log.warning("prune %s failed: %s", d, e)
+            try:
+                removed = prune_old_versions()
+                if removed:
+                    log.info("pruned %d superseded agent version(s): %s", len(removed), removed)
+            except Exception as e:
+                log.warning("prune old versions failed: %s", e)
             stop_event.wait(interval)
 
     t = threading.Thread(target=loop, name="cache-pruner", daemon=True)

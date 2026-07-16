@@ -427,14 +427,29 @@ def fetch_hikvision(host: str, http_port: int, rtsp_port: int,
         return download_clip_rtsp(host, rtsp_port, username, password, track, start_iso, end_iso, out_path), "hikvision-rtsp-fallback"
 
 
-def upload_to_s3(presigned_put_url: str, file_path: str, timeout: int = 300) -> None:
+def upload_to_s3(presigned_put_url: str, file_path: str, timeout: int = 300,
+                  attempts: int = 3) -> None:
     """PUT the file to a presigned S3 URL. No auth header — the signature is in
-    the URL; sending the agent's Bearer token would break the S3 signature."""
-    with open(file_path, "rb") as f:
-        r = requests.put(presigned_put_url, data=f,
-                         headers={"Content-Type": "video/mp4"}, timeout=timeout)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"S3 upload HTTP {r.status_code}: {r.text[:200]}")
+    the URL; sending the agent's Bearer token would break the S3 signature.
+    Retries on transient failures (flaky wifi, brief network drop) since most
+    upload failures are temporary."""
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with open(file_path, "rb") as f:
+                r = requests.put(presigned_put_url, data=f,
+                                 headers={"Content-Type": "video/mp4"}, timeout=timeout)
+            if r.status_code in (200, 201):
+                return
+            raise RuntimeError(f"S3 upload HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            last_err = e
+            if attempt < attempts:
+                wait = 5 * attempt
+                log.warning("clip upload attempt %s/%s failed (%s) — retrying in %ss",
+                            attempt, attempts, e, wait)
+                time.sleep(wait)
+    raise last_err
 
 
 def handle_fetch_clip(payload: dict, work_dir: str) -> dict:
@@ -459,25 +474,31 @@ def handle_fetch_clip(payload: dict, work_dir: str) -> dict:
     log.info("fetch_clip %s vendor=%s channel=%s", job_id, vendor, channel)
 
     t0 = time.time()
-    if vendor == "dahua":
-        dahua_ch = dahua_channel_from_path(rtsp_path, channel)
-        bytes_written = download_dav_dahua(host, http_port, user, pw, dahua_ch, start_iso, end_iso, out_path)
-        method = "dahua-loadfile"
-    elif vendor == "hikvision":
-        # Auto-picks ISAPI fast-download+trim vs realtime RTSP, whichever is
-        # faster for this window/segment, with RTSP fallback on error.
-        bytes_written, method = fetch_hikvision(host, http_port, rtsp_port, user, pw,
-                                                channel, rtsp_path, start_iso, end_iso, out_path, work_dir)
-    else:
-        track = hik_track_from_path(rtsp_path, channel)
-        bytes_written = download_clip_rtsp(host, rtsp_port, user, pw, track, start_iso, end_iso, out_path)
-        method = "rtsp"
-
-    log.info("clip %s via %s: %.0f KB in %.0fs", job_id, method, bytes_written / 1024, time.time() - t0)
-    upload_to_s3(payload["presigned_put_url"], out_path)
     try:
-        os.remove(out_path)
-    except OSError:
-        pass
+        if vendor == "dahua":
+            dahua_ch = dahua_channel_from_path(rtsp_path, channel)
+            bytes_written = download_dav_dahua(host, http_port, user, pw, dahua_ch, start_iso, end_iso, out_path)
+            method = "dahua-loadfile"
+        elif vendor == "hikvision":
+            # Auto-picks ISAPI fast-download+trim vs realtime RTSP, whichever is
+            # faster for this window/segment, with RTSP fallback on error.
+            bytes_written, method = fetch_hikvision(host, http_port, rtsp_port, user, pw,
+                                                    channel, rtsp_path, start_iso, end_iso, out_path, work_dir)
+        else:
+            track = hik_track_from_path(rtsp_path, channel)
+            bytes_written = download_clip_rtsp(host, rtsp_port, user, pw, track, start_iso, end_iso, out_path)
+            method = "rtsp"
+
+        log.info("clip %s via %s: %.0f KB in %.0fs", job_id, method, bytes_written / 1024, time.time() - t0)
+        upload_to_s3(payload["presigned_put_url"], out_path)
+    finally:
+        # Delete the local copy no matter where things failed — a bad/partial
+        # download (e.g. a muxer error mid-write) or a failed upload should
+        # never leave a file sitting on disk; the whole job just gets
+        # retried fresh from scratch next time.
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
     return {"clip_s3_key": payload.get("clip_s3_key"), "bytes": bytes_written,
             "vendor": vendor, "method": method}

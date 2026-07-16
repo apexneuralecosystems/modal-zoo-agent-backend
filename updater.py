@@ -25,8 +25,8 @@ from pathlib import Path
 import requests
 
 from agent_paths import (
-    AGENT_ROOT, CURRENT_VERSION_FILE, FAILED_VERSIONS_FILE, STABLE_FILE,
-    VERSIONS_DIR, running_version,
+    AGENT_ROOT, CURRENT_VERSION_FILE, FAILED_VERSIONS_FILE, LAST_GOOD_FILE,
+    STABLE_FILE, VERSIONS_DIR, running_version,
 )
 
 log = logging.getLogger("agent.updater")
@@ -214,6 +214,51 @@ def apply_upgrade(payload: dict, download=None) -> str:
     write_current_version(version)
     log.info("upgrade applied: current_version -> %s", version)
     return version
+
+
+def _read_pointer(path: Path) -> str | None:
+    try:
+        v = path.read_text(encoding="utf-8").strip()
+        return v or None
+    except OSError:
+        return None
+
+
+def prune_old_versions() -> list[str]:
+    """Delete every versions/<v>/ folder except the ones that must always stay
+    on disk: the version currently running, the Stable fallback, and the
+    last-known-good version. watchdog.py's rollback never re-downloads at
+    rollback time — it requires the target folder to already be present —
+    so those three are permanently protected. Anything else is safe to
+    remove; if a Mac is ever told to run an old version again, apply_upgrade
+    just re-downloads it fresh (same as a first-time install).
+
+    Skips dotfile/staging entries (e.g. `.1.2.0.staging`) since those are
+    in-progress unpacks, not finished versions.
+
+    Returns the list of version names actually removed."""
+    if not VERSIONS_DIR.is_dir():
+        return []
+
+    protected = {running_version()}
+    for f in (CURRENT_VERSION_FILE, STABLE_FILE, LAST_GOOD_FILE):
+        v = _read_pointer(f)
+        if v:
+            protected.add(v)
+
+    removed = []
+    for entry in VERSIONS_DIR.iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        if entry.name in protected:
+            continue
+        try:
+            shutil.rmtree(entry)
+            removed.append(entry.name)
+            log.info("pruned superseded agent version: %s", entry.name)
+        except OSError as e:
+            log.warning("could not remove old version %s: %s", entry.name, e)
+    return removed
 
 
 def handle_upgrade(payload: dict, api, stop_event: threading.Event) -> dict:

@@ -152,3 +152,41 @@ def test_handle_upgrade_skips_if_already_running_target_version(tmp_path, monkey
     assert result == {"version": "1.1.0", "already_current": True}
     assert calls == []  # apply_upgrade must never be invoked
     assert not stop.is_set()  # nothing changed, no restart needed
+
+
+def test_prune_old_versions_keeps_current_stable_and_last_good(tmp_path, monkeypatch):
+    updater, ap = _setup(tmp_path, monkeypatch, current="1.3.0")
+    for v in ("1.0.0", "1.1.0", "1.2.0", "1.2.5", "1.3.0"):
+        (ap.VERSIONS_DIR / v).mkdir(parents=True, exist_ok=True)
+    ap.STABLE_FILE.write_text("1.2.0\n", encoding="utf-8")
+    ap.LAST_GOOD_FILE.write_text("1.2.5\n", encoding="utf-8")
+
+    removed = updater.prune_old_versions()
+
+    assert sorted(removed) == ["1.0.0", "1.1.0"]
+    assert (ap.VERSIONS_DIR / "1.3.0").exists()  # currently running
+    assert (ap.VERSIONS_DIR / "1.2.0").exists()  # stable fallback
+    assert (ap.VERSIONS_DIR / "1.2.5").exists()  # last known good
+    assert not (ap.VERSIONS_DIR / "1.0.0").exists()
+    assert not (ap.VERSIONS_DIR / "1.1.0").exists()
+
+
+def test_prune_old_versions_skips_in_progress_staging_dirs(tmp_path, monkeypatch):
+    updater, ap = _setup(tmp_path, monkeypatch, current="1.0.0")
+    staging = ap.VERSIONS_DIR / ".1.4.0.staging"
+    staging.mkdir(parents=True)
+    (staging / "partial.txt").write_text("mid-unpack\n", encoding="utf-8")
+
+    removed = updater.prune_old_versions()
+
+    assert removed == []
+    assert staging.exists()  # dotfile/staging entries are never touched
+
+
+def test_prune_old_versions_noop_when_nothing_superseded(tmp_path, monkeypatch):
+    updater, ap = _setup(tmp_path, monkeypatch, current="1.0.0")
+
+    removed = updater.prune_old_versions()
+
+    assert removed == []
+    assert (ap.VERSIONS_DIR / "1.0.0").exists()
