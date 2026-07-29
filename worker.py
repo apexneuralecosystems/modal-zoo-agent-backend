@@ -29,6 +29,21 @@ from asset_cache import fetch_to_cache
 from config_loader import load_config, setup_logging
 
 
+def _crop_to_zone(frame, zone):
+    """zone is a normalized {x,y,w,h} rectangle (0-1, top-left origin), or
+    None/falsy for "full frame" (today's default, unchanged). Returns a view
+    into `frame` -- the inference script never knows a zone was involved, it
+    just receives a smaller frame and detects on it like always."""
+    if not zone:
+        return frame
+    h, w = frame.shape[:2]
+    x1 = max(0, min(w - 1, int(zone.get("x", 0) * w)))
+    y1 = max(0, min(h - 1, int(zone.get("y", 0) * h)))
+    x2 = max(x1 + 1, min(w, int((zone.get("x", 0) + zone.get("w", 1)) * w)))
+    y2 = max(y1 + 1, min(h, int((zone.get("y", 0) + zone.get("h", 1)) * h)))
+    return frame[y1:y2, x1:x2]
+
+
 def _load_inference_module(path: str):
     spec = importlib.util.spec_from_file_location("inference", path)
     if not spec or not spec.loader:
@@ -62,6 +77,9 @@ def main():
     inference_url = pipeline["inference_script_presigned_url"]
     cfg_block = pipeline.get("config", {}) or {}
     frame_interval = max(1, int(cfg_block.get("frame_interval", 5)))
+    # Normalized {x,y,w,h} crop box (deploy-time "zone only" option) -- see
+    # _crop_to_zone(). None means full frame, same as before this existed.
+    zone = pipeline.get("zone") or None
 
     # Multi-model pipelines send a list of {node_id, url, filename}; legacy
     # single-model pipelines only send `model_presigned_url`. Normalise to a
@@ -128,6 +146,9 @@ def main():
             # Severity used by every alert this deployment fires. Only
             # meaningful when output_kind == 'alert'. Defaults to 'warning'.
             "alert_severity": (pipeline.get("alert_severity") or "warning"),
+            # Values for this model's declared custom_fields (see
+            # model.entity.ts's custom_fields column), keyed by field key.
+            "custom_values": dict(pipeline.get("custom_values") or {}),
         })
     except Exception as e:
         log.error("inference module load failed: %s", e)
@@ -200,7 +221,9 @@ def main():
                 if frame_idx % frame_interval != 0:
                     continue
                 try:
-                    inf.run(frame)
+                    # Crop happens only for the model's view -- record_frame_fn
+                    # above already got the full, uncropped frame.
+                    inf.run(_crop_to_zone(frame, zone))
                     inferred += 1
                 except Exception as e:
                     log.warning("inference run error: %s", e)

@@ -27,6 +27,14 @@ HEATMAP_WORKER_PATH = str(Path(__file__).resolve().parent / "heatmap_worker.py")
 # respawn the worker every tick forever, pegging the Mac's CPU. This is
 # distinct from the exit(99) RTSP-dead-12h path below.
 DOWNLOAD_FAILURE_EXIT_CODE = 2
+# worker.py sys.exit(3)s when the inference script/model fails to *load*
+# after a successful download (e.g. a corrupt .pt, a script missing
+# set_context()/run(), or an exception raised while importing it). Before
+# this fix, this exit code fell through to the generic "else" branch in
+# _reap() and was silently retried forever with nothing ever reported to the
+# backend -- a deployment could crash-loop indefinitely while its DB status
+# stayed "running", with zero visibility anywhere in the platform.
+SCRIPT_LOAD_FAILURE_EXIT_CODE = 3
 MAX_DOWNLOAD_FAILURES = 5
 DOWNLOAD_RETRY_BACKOFF_S = 30
 
@@ -78,6 +86,8 @@ def _pipeline_hash(pipeline: dict) -> str:
         "config": pipeline.get("config") or {},
         "event_types": pipeline.get("event_types") or [],
         "pipeline_id": pipeline.get("pipeline_id"),
+        "custom_values": pipeline.get("custom_values") or {},
+        "zone": pipeline.get("zone"),
     }
     blob = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha1(blob).hexdigest()
@@ -258,8 +268,11 @@ class JobPoller:
         """Drop entries whose subprocess has died so they get respawned.
         Exit code 99 means RTSP has been unreachable for 12h — mark the
         deployment camera_offline in the backend and stop respawning.
-        Exit code 2 means the model/inference-script download failed — back
-        off and retry a bounded number of times (see _on_download_failure)."""
+        Exit code 2 means the model/inference-script download failed; exit
+        code 3 means it downloaded fine but failed to load (corrupt weights,
+        a script missing set_context()/run(), or an import-time exception).
+        Both back off and retry a bounded number of times, then report the
+        failure to the backend (see _on_worker_failure)."""
         dead = [d for d, p in self.running.items() if p.poll() is not None]
         for d in dead:
             code = self.running[d].returncode
@@ -278,27 +291,34 @@ class JobPoller:
                 # 99/else branches) — _tick() compares it against the freshly
                 # fetched pipeline hash to tell whether anything actually
                 # changed before it retries or gives up.
-                self._on_download_failure(d)
+                self._on_worker_failure(d, reason="model_download_failed")
+            elif code == SCRIPT_LOAD_FAILURE_EXIT_CODE and not d.startswith("heatmap:"):
+                self._on_worker_failure(d, reason="inference_script_failed")
             else:
                 self.hashes.pop(d, None)
                 self.download_failures.pop(d, None)
 
-    def _on_download_failure(self, dep_id: str):
+    def _on_worker_failure(self, dep_id: str, reason: str):
+        """Shared backoff + backend-reporting path for worker.py failures that
+        happen before the RTSP loop ever starts (asset download, or inference
+        script/model load). Without this, a bad model file or a broken
+        inference script crash-loops the worker forever with the deployment's
+        DB status stuck on "running" and no error visible anywhere."""
         count = self.download_failures.get(dep_id, {}).get("count", 0) + 1
         if count >= MAX_DOWNLOAD_FAILURES:
             log.error(
-                "dep=%s asset download failed %d times — giving up until the pipeline changes",
-                dep_id, count,
+                "dep=%s worker failed %d times (%s) — giving up until the pipeline changes",
+                dep_id, count, reason,
             )
             self.download_failures[dep_id] = {"count": count, "given_up": True}
             try:
-                self.api.mark_deployment_failed(dep_id, reason="model_download_failed")
+                self.api.mark_deployment_failed(dep_id, reason=reason)
             except Exception as e:
-                log.warning("failed to report download failure for dep=%s: %s", dep_id, e)
+                log.warning("failed to report worker failure for dep=%s: %s", dep_id, e)
         else:
             log.warning(
-                "dep=%s asset download failed (%d/%d) — retrying in %ss",
-                dep_id, count, MAX_DOWNLOAD_FAILURES, DOWNLOAD_RETRY_BACKOFF_S,
+                "dep=%s worker failed (%d/%d, %s) — retrying in %ss",
+                dep_id, count, MAX_DOWNLOAD_FAILURES, reason, DOWNLOAD_RETRY_BACKOFF_S,
             )
             self.download_failures[dep_id] = {
                 "count": count,

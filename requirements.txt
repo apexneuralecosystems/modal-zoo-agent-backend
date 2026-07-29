@@ -10,6 +10,12 @@ av==16.0.1
 # Mac without "Can't get attribute 'Segment26'" or similar class-not-found errors.
 ultralytics>=8.4.51
 numpy==1.26.4
+# zoneinfo (stdlib) needs an IANA tz database to resolve named zones like
+# "Asia/Kolkata". Linux/macOS normally have one on the system already; Windows
+# does not, so ZoneInfo(name) silently raises ZoneInfoNotFoundError there
+# unless this package provides the data. Harmless no-op on platforms that
+# already have system tzdata.
+tzdata>=2024.1
 psutil==6.1.0
 websocket-client==1.8.0
 boto3>=1.34.0
