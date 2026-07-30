@@ -1,69 +1,47 @@
 """Live-preview WebSocket client.
 
 Persistent connection to the cloud's /ws/agent endpoint. Listens for
-control messages from the cloud and pumps JPEG frames back over the same
-socket whenever a viewer is asking for a particular camera.
-
-Wire format for binary frames sent UP to the cloud:
-    [16 bytes camera_id (UUID without dashes, hex-decoded)] + [JPEG bytes]
+control/signaling messages from the cloud; live video itself flows over a
+separate WebRTC connection per camera (see webrtc_streamer.py) — this socket
+only carries the start/stop signal and the WebRTC offer/answer/ICE exchange.
 
 Control messages received DOWN from the cloud (text JSON):
     { "type": "start-stream", "camera_id": "<uuid>", "rtsp_url": "rtsp://..." }
     { "type": "stop-stream",  "camera_id": "<uuid>" }
+    { "type": "webrtc-answer", "camera_id": "<uuid>", "sdp": "..." }
+    { "type": "webrtc-ice-candidate", "camera_id": "<uuid>", "candidate": {...} }
+
+Messages sent UP to the cloud (text JSON):
+    { "type": "webrtc-offer", "camera_id": "<uuid>", "sdp": "..." }
 
 Design notes:
-- One worker thread per active camera; the main WS reader stays cheap.
+- One WebRTC session per active camera (WebRTCStreamerManager); the main WS
+  reader stays cheap — it just dispatches signaling messages.
 - We rebuild the WS connection with exponential backoff on failure, mirroring
   what the existing HTTP client does for /agent/heartbeat etc.
-- Frames are dropped (not buffered) when the encoder is faster than the WS;
-  this prevents memory blow-up if the cloud or browser stalls.
 """
 from __future__ import annotations
 
 import base64
 import json
 import logging
-import os
 import threading
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 
 import av  # PyAV — decodes the camera H.264 that OpenCV's FFmpeg can't
-import cv2  # used ONLY for JPEG encoding of decoded frames
+import cv2  # used ONLY for JPEG encoding of probe/snapshot frames
 import websocket  # websocket-client
 
-# Silence PyAV/FFmpeg logging. PyAV forwards FFmpeg messages both to stderr
-# (av.logging.set_level) and into Python's logging under the `libav.*` loggers;
-# we mute both so the console isn't flooded with transient RTSP/decode notices.
-try:
-    av.logging.set_level(av.logging.CRITICAL)
-except Exception:
-    pass
-logging.getLogger("libav").setLevel(logging.CRITICAL)
+from rtsp_common import AV_OPEN_TIMEOUT_S as _AV_OPEN_TIMEOUT_S
+from rtsp_common import AV_OPTS as _AV_OPTS
+from rtsp_common import nvr_now as _nvr_now
+from rtsp_common import redact as _redact
+from rtsp_common import to_near_live_url as _to_near_live_url
+from webrtc_streamer import WebRTCStreamerManager
 
-# RTSP open options for PyAV — kept deliberately MINIMAL. This is the proven
-# recipe (verified against the real NVR, which decoded a clean 1920x1080 frame):
-#   - rtsp_transport=tcp : ordered packets, reliable across NAT/Wi-Fi.
-#   - stimeout/rw_timeout (microseconds): give up on a stalled socket (~8s).
-# We do NOT pass extra demux flags here:
-#   - nobuffer/low_delay/reorder_queue_size : some Hikvision firmware 404s the
-#     DESCRIBE when present. Low latency is handled at the read side instead, by
-#     dropping frames that arrive early (see the pacing in _StreamWorker._run).
-#   - err_detect=ignore_err / fflags=discardcorrupt : observed to drop the
-#     keyframe and make decoding WORSE. Tolerance is handled by the demux loop,
-#     which skips corrupt pre-keyframe packets and waits for the first IDR.
-_AV_OPTS = {
-    "rtsp_transport": "tcp",
-    "stimeout": "8000000",
-    "rw_timeout": "8000000",
-}
-# Seconds PyAV waits for the initial RTSP open before raising.
-_AV_OPEN_TIMEOUT_S = 10
-
-# Silence OpenCV's logger too (we still import cv2 for imencode).
+# Silence OpenCV's logger too (we still import cv2 for imencode in probe/snapshot).
 try:
     cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
 except Exception:
@@ -72,7 +50,6 @@ except Exception:
 log = logging.getLogger("agent.stream")
 
 JPEG_QUALITY = 70
-TARGET_FPS = 12
 RECONNECT_INITIAL_S = 2
 RECONNECT_MAX_S = 60
 
@@ -82,77 +59,6 @@ def _http_to_ws(server_url: str) -> str:
     p = urlparse(server_url)
     scheme = "wss" if p.scheme == "https" else "ws"
     return f"{scheme}://{p.netloc}{p.path or ''}".rstrip("/")
-
-
-def _redact(url: str) -> str:
-    """Mask the password in `rtsp://user:pass@host/...` for log output."""
-    p = urlparse(url)
-    if p.password:
-        netloc = f"{p.username}:***@{p.hostname}"
-        if p.port:
-            netloc += f":{p.port}"
-        return url.replace(p.netloc, netloc)
-    return url
-
-
-def _camera_id_to_bytes(camera_id: str) -> bytes:
-    """UUID string → 16 raw bytes prefix used in binary frames."""
-    return bytes.fromhex(camera_id.replace("-", ""))
-
-
-def _nvr_now(rtsp_url: str) -> datetime:
-    """Best-effort current wall-clock of the NVR, read from its own ISAPI clock.
-
-    Hikvision RTSP playback interprets the `starttime` against the NVR's LOCAL
-    wall clock (verified in testing: localTime + 'Z' returned the right footage),
-    so we must anchor to the NVR's clock, not the cloud's or even the Mac's.
-    Falls back to the agent's local clock if the read fails (the Mac is on-site,
-    usually the same timezone). Never raises.
-    """
-    try:
-        import requests  # already an agent dependency (used by api_client)
-        from requests.auth import HTTPDigestAuth
-
-        p = urlparse(rtsp_url)
-        host = p.hostname
-        user = unquote(p.username) if p.username else ""
-        pwd = unquote(p.password) if p.password else ""
-        r = requests.get(
-            f"http://{host}/ISAPI/System/time",
-            auth=HTTPDigestAuth(user, pwd),
-            timeout=5,
-        )
-        if r.status_code == 200:
-            import xml.etree.ElementTree as ET
-            flat = {e.tag.split("}")[-1]: e.text for e in ET.fromstring(r.text).iter()}
-            lt = flat.get("localTime")  # e.g. 2026-06-16T12:34:42+05:30
-            if lt:
-                return datetime.strptime(lt[:19], "%Y-%m-%dT%H:%M:%S")
-    except Exception as e:
-        log.warning("near-live: NVR clock read failed (%s); using local clock", e)
-    return datetime.now()
-
-
-def _to_near_live_url(rtsp_url: str, delay_seconds: int) -> str:
-    """Convert a Hikvision LIVE channel URL into a near-live PLAYBACK URL that
-    starts `delay_seconds` behind the NVR's clock and plays forward, staying
-    ~that far behind live.
-
-        rtsp://…/Streaming/Channels/NN01
-          → rtsp://…/Streaming/tracks/NN01?starttime=<NVR_now − delay>Z
-
-    Open-ended (no endtime) so the NVR keeps feeding recorded data forward. If
-    the URL isn't a Hikvision Channels path we can't build a playback form, so
-    we return it unchanged (falls back to live) rather than emit a bad URL.
-    """
-    if "/Streaming/Channels/" not in rtsp_url:
-        log.warning("near-live: non-Hikvision path, falling back to live: %s", _redact(rtsp_url))
-        return rtsp_url
-    start = _nvr_now(rtsp_url) - timedelta(seconds=delay_seconds)
-    ts = start.strftime("%Y%m%dT%H%M%SZ")
-    base = rtsp_url.replace("/Streaming/Channels/", "/Streaming/tracks/")
-    sep = "&" if "?" in base else "?"
-    return f"{base}{sep}starttime={ts}"
 
 
 def _probe_rtsp(url: str, timeout_s: float = 10.0, near_live_delay: Optional[int] = None) -> dict:
@@ -295,168 +201,17 @@ def _capture_snapshot(url: str, timeout_s: float = 10.0, near_live_delay: Option
     return result
 
 
-@dataclass
-class _StreamWorker:
-    """One per active camera. Reads RTSP frames and pushes JPEGs over the WS."""
-    camera_id: str
-    rtsp_url: str
-    ws: websocket.WebSocket
-    stop_event: threading.Event
-    thread: Optional[threading.Thread] = None
-    # When set, stream a near-live RECORDED feed this many seconds behind live
-    # instead of the real-time stream (super-admin "playback" mode). None = live.
-    near_live_delay: Optional[int] = None
-
-    def start(self) -> None:
-        self.thread = threading.Thread(target=self._run, name=f"stream-{self.camera_id[:8]}", daemon=True)
-        self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-    def _run(self) -> None:
-        # PyAV path. OpenCV's bundled FFmpeg cannot decode many real-world
-        # Hikvision H.264 streams (endless cabac_init_idc / PPS errors, zero
-        # frames). PyAV ships a newer FFmpeg that decodes them cleanly — proven
-        # against the production NVR (1920x1080 yuv420p h264 decoded on the
-        # first frame). So we demux+decode with PyAV and only use cv2 for the
-        # JPEG encode (which always worked).
-        mode = f"near-live(-{self.near_live_delay}s)" if self.near_live_delay else "live"
-        log.info("stream cam=%s: opening [%s] %s", self.camera_id, mode, _redact(self.rtsp_url))
-
-        prefix = _camera_id_to_bytes(self.camera_id)
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-        period = 1.0 / TARGET_FPS
-        exit_reason = "stop_event"
-        # Gentle reconnect backoff. Hikvision NVRs throttle (and send
-        # undecodable packets to) a client that reopens RTSP too fast, so we
-        # start at 3s and back off to 30s rather than hammering on failure.
-        backoff = 3.0
-        started_logged = False
-        try:
-            while not self.stop_event.is_set():
-                # Resolve the URL to open on EACH (re)connect. In near-live mode
-                # this recomputes the playback start time so a reconnect re-syncs
-                # to ~delay behind live instead of replaying from the old anchor.
-                if self.near_live_delay:
-                    open_url = _to_near_live_url(self.rtsp_url, self.near_live_delay)
-                else:
-                    open_url = self.rtsp_url
-                try:
-                    container = av.open(
-                        open_url,
-                        options=_AV_OPTS,
-                        timeout=_AV_OPEN_TIMEOUT_S,
-                    )
-                except Exception as e:
-                    log.warning("stream cam=%s: open failed (%s), retry in %.0fs",
-                                self.camera_id, e, backoff)
-                    if self.stop_event.wait(backoff):
-                        return
-                    backoff = min(30.0, backoff * 2)
-                    continue
-
-                backoff = 3.0  # reset to the gentle base on a successful open
-                try:
-                    vstream = next((s for s in container.streams if s.type == "video"), None)
-                    if vstream is None:
-                        log.warning("stream cam=%s: no video stream", self.camera_id)
-                        container.close()
-                        if self.stop_event.wait(2.0):
-                            return
-                        continue
-                    # Decode threads + drop late frames: we want the freshest
-                    # frame, not a backlog. PyAV honours this on the codec ctx.
-                    vstream.thread_type = "AUTO"
-                    if not started_logged:
-                        log.info("stream cam=%s: started (codec=%s)",
-                                 self.camera_id, vstream.codec_context.name)
-                        started_logged = True
-
-                    next_tick = time.monotonic()
-                    # Demux packets and decode each in its own try, skipping any
-                    # corrupt packet (the pre-keyframe garbage a Hikvision stream
-                    # emits) instead of letting it abort the whole session. This
-                    # is what VLC does — and the reason VLC plays this camera
-                    # while a plain container.decode() loop raised InvalidData.
-                    for packet in container.demux(vstream):
-                        if self.stop_event.is_set():
-                            exit_reason = "stop_event"
-                            container.close()
-                            return
-                        try:
-                            frames = packet.decode()
-                        except Exception:
-                            # Corrupt/incomplete packet — skip, wait for the
-                            # next (clean) one. Do NOT reconnect on these.
-                            continue
-                        for frame in frames:
-                            # Skip tiny parameter-set fragments (e.g. 48x16) the
-                            # decoder emits before a real picture — they're not
-                            # viewable frames and would just send junk JPEGs.
-                            if frame.width < 160:
-                                continue
-                            # Pace to TARGET_FPS by DROPPING frames that arrive
-                            # early — keeps latency low (live, not buffered).
-                            now = time.monotonic()
-                            if now < next_tick:
-                                continue
-                            next_tick = now + period
-
-                            try:
-                                img = frame.to_ndarray(format="bgr24")
-                            except Exception:
-                                continue
-                            try:
-                                ok, jpg = cv2.imencode(".jpg", img, encode_params)
-                            except Exception as e:
-                                exit_reason = f"imencode exception: {e}"
-                                container.close()
-                                return
-                            if not ok:
-                                continue
-                            try:
-                                self.ws.send_bytes(prefix + jpg.tobytes())
-                            except Exception as e:
-                                exit_reason = f"ws send failed: {e}"
-                                container.close()
-                                return
-                    # demux() ended → the RTSP source dropped.
-                    # Close and let the outer while-loop reconnect with backoff.
-                    log.warning("stream cam=%s: stream ended, reconnecting", self.camera_id)
-                    container.close()
-                    if self.stop_event.wait(backoff):
-                        return
-                except av.error.EOFError:
-                    container.close()
-                    if self.stop_event.wait(backoff):
-                        return
-                except Exception as e:
-                    # Mid-stream decode/transport error — close and reconnect
-                    # rather than die. PyAV recovers cleanly on a fresh open.
-                    log.warning("stream cam=%s: stream error (%s), reconnecting",
-                                self.camera_id, e)
-                    try:
-                        container.close()
-                    except Exception:
-                        pass
-                    if self.stop_event.wait(backoff):
-                        return
-        except Exception as e:
-            exit_reason = f"unexpected exception: {e!r}"
-        finally:
-            log.info("stream cam=%s: stopped (reason=%s)", self.camera_id, exit_reason)
+# RTSP capture + video encoding for live preview now live in webrtc_streamer.py
+# (WebRTCStreamerManager / _WebRTCSession / _RtspVideoTrack) — real WebRTC
+# media replaced the JPEG-per-frame relay that used to live here.
 
 
 class _WsAdapter:
-    """Tiny shim so workers can call .send_bytes() without knowing about websocket-client internals."""
+    """Tiny shim so webrtc_streamer can call .send_text() without knowing
+    about websocket-client internals."""
     def __init__(self, ws: websocket.WebSocket):
         self.ws = ws
         self.lock = threading.Lock()
-
-    def send_bytes(self, data: bytes) -> None:
-        with self.lock:
-            self.ws.send_binary(data)
 
     def send_text(self, s: str) -> None:
         with self.lock:
@@ -470,7 +225,7 @@ def start_ws_streamer(server_url: str, secret_token: str, stop_event: threading.
     def loop():
         backoff = RECONNECT_INITIAL_S
         while not stop_event.is_set():
-            workers: dict[str, _StreamWorker] = {}
+            webrtc_manager = WebRTCStreamerManager()
             adapter: Optional[_WsAdapter] = None
             try:
                 log.info("connecting to %s", ws_url)
@@ -510,9 +265,6 @@ def start_ws_streamer(server_url: str, secret_token: str, stop_event: threading.
                         rtsp = cmd.get("rtsp_url")
                         if not cam or not rtsp:
                             continue
-                        # If a worker exists already, leave it alone (idempotent).
-                        if cam in workers:
-                            continue
                         # Present only in super-admin "playback" mode; absent =
                         # live (unchanged). Ignore non-positive / bad values.
                         delay_raw = cmd.get("near_live_delay_seconds")
@@ -522,14 +274,23 @@ def start_ws_streamer(server_url: str, secret_token: str, stop_event: threading.
                                 near_live = None
                         except (TypeError, ValueError):
                             near_live = None
-                        w = _StreamWorker(cam, rtsp, adapter, threading.Event(), near_live_delay=near_live)
-                        workers[cam] = w
-                        w.start()
+                        # start_stream() is itself idempotent — a second
+                        # start-stream for a camera already streaming (e.g. a
+                        # 2nd viewer joining) is a no-op.
+                        webrtc_manager.start_stream(cam, rtsp, near_live, adapter.send_text)
                     elif t == "stop-stream":
                         cam = cmd.get("camera_id")
-                        w = workers.pop(cam, None)
-                        if w:
-                            w.stop()
+                        webrtc_manager.stop_stream(cam)
+                    elif t == "webrtc-answer":
+                        cam = cmd.get("camera_id")
+                        sdp = cmd.get("sdp")
+                        if cam and sdp:
+                            webrtc_manager.handle_answer(cam, sdp)
+                    elif t == "webrtc-ice-candidate":
+                        cam = cmd.get("camera_id")
+                        candidate = cmd.get("candidate")
+                        if cam and candidate:
+                            webrtc_manager.handle_ice_candidate(cam, candidate)
                     elif t == "probe":
                         # Cloud is asking us to test a stream URL from the LAN
                         # (the "Test stream health" button). Run it off the
@@ -599,10 +360,9 @@ def start_ws_streamer(server_url: str, secret_token: str, stop_event: threading.
             except Exception as e:
                 log.warning("ws loop error: %s", e)
             finally:
-                # Tear down workers before reconnect so we don't leak captures.
-                for w in workers.values():
-                    w.stop()
-                workers.clear()
+                # Tear down all WebRTC sessions before reconnect so we don't
+                # leak RTSP captures or dangling peer connections.
+                webrtc_manager.stop_all()
                 try:
                     if adapter is not None:
                         adapter.ws.close()

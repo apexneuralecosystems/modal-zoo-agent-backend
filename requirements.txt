@@ -20,3 +20,7 @@ psutil==6.1.0
 websocket-client==1.8.0
 boto3>=1.34.0
 imageio-ffmpeg>=0.5.0
+# WebRTC for live preview (webrtc_streamer.py) -- replaced the old JPEG-per-
+# frame-over-WebSocket relay with real video. Builds on the same PyAV frames
+# already used for RTSP capture elsewhere in this file.
+aiortc>=1.10.0
